@@ -272,4 +272,5 @@ $RECYCLE.BIN/
 
 
 
-# Extras
+# FFMPEG binaries
+ffmpeg/
