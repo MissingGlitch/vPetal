@@ -1,7 +1,9 @@
 import os
+import re
 import sys
 import platform
 import logging
+import logging.handlers
 import discord
 import yt_dlp
 from discord import app_commands
@@ -101,17 +103,45 @@ _formatter = _EmojiFormatter(
 _handler = logging.StreamHandler()
 _handler.setFormatter(_formatter)
 
+#* Log file handlers (rotating)
+# Two categories, kept in /logs: "all.log" captures everything (DEBUG+),
+# "errors.log" captures only WARNING/ERROR. Each category rotates at 2 MB
+# and keeps at most 3 files total (the active file + 2 backups); once the
+# 3rd fills up, the oldest is discarded and a new one takes its place.
+os.makedirs("logs", exist_ok=True)
+
+_all_file_handler = logging.handlers.RotatingFileHandler(
+	filename=os.path.join("logs", "all.log"),
+	encoding="utf-8",
+	maxBytes=2 * 1024 * 1024,  # 2 MiB
+	backupCount=2,  # active file + 2 backups = 3 files max
+)
+_all_file_handler.setFormatter(_formatter)
+
+_errors_file_handler = logging.handlers.RotatingFileHandler(
+	filename=os.path.join("logs", "errors.log"),
+	encoding="utf-8",
+	maxBytes=2 * 1024 * 1024,  # 2 MiB
+	backupCount=2,  # active file + 2 backups = 3 files max
+)
+_errors_file_handler.setLevel(logging.WARNING)
+_errors_file_handler.setFormatter(_formatter)
+
 # Separate logger for our own bot events (command usage, playback flow),
 # kept independent from discord.py's internal "discord" logger.
 logger = logging.getLogger("vPetal")
 logger.setLevel(logging.DEBUG)
 logger.addHandler(_handler)
+logger.addHandler(_all_file_handler)
+logger.addHandler(_errors_file_handler)
 
 # Apply the same formatter to discord.py's own top-level logger, so every
 # log line (ours and the library's) follows the same readable format.
 discord_logger = logging.getLogger("discord")
 discord_logger.setLevel(logging.INFO)
 discord_logger.addHandler(_handler)
+discord_logger.addHandler(_all_file_handler)
+discord_logger.addHandler(_errors_file_handler)
 discord_logger.propagate = False
 
 # --- Deep debugging (commented out by default) ---
@@ -147,7 +177,7 @@ async def on_ready():
 async def play(interaction: discord.Interaction, url: str):
 	"""Joins the caller's voice channel and streams audio from the given URL."""
 	# Log command usage: who invoked it, and with which URL
-	logger.info(f"@{interaction.user} used /play with url=\"{url}\" in guild=\"{interaction.guild}\"")
+	logger.info(f"🕹️   @{interaction.user} used /play with url=\"{url}\" in guild=\"{interaction.guild}\" 🕹️")
 
 	# Verify the user is currently in a voice channel
 	if interaction.user.voice is None:
@@ -184,9 +214,22 @@ async def play(interaction: discord.Interaction, url: str):
 		voice_client.stop()
 
 	# Build the audio source and start playback
-	# Debug: capture ffmpeg's stderr to a file, since it's not captured by default,
-	# and log on playback error/finish regardless of logger configuration
-	ffmpeg_log = open("ffmpeg_debug.log", "wb")
+	# Route ffmpeg's stderr through a custom writer instead of a plain file,
+	# so lines are logged live (through our own formatted logger) as ffmpeg
+	# emits them, instead of being silently written to disk with no visibility.
+	class _FFmpegStderrLogger:
+		def __init__(self):
+			self._buffer = b""
+
+		def write(self, data):
+			text = data.decode(errors="ignore").strip()
+			if not text:
+				return
+			# Truncate long googlevideo.com URLs (query strings can be 1000+ chars)
+			# so a single ffmpeg error line doesn't flood the terminal/log files.
+			text = re.sub(r"(https://[^\s]{30})[^\s]+", r"\1... [truncated]", text)
+			for line in text.splitlines():
+				logger.error(f"[FFMPEG] {line}")
 
 	def _on_playback_error(error):
 		if error:
@@ -194,7 +237,7 @@ async def play(interaction: discord.Interaction, url: str):
 		else:
 			logger.debug(f"Playback of \"{title}\" finished without errors")
 
-	source = discord.FFmpegPCMAudio(audio_url, executable=FFMPEG_PATH, stderr=ffmpeg_log, **FFMPEG_OPTIONS)
+	source = discord.FFmpegPCMAudio(audio_url, executable=FFMPEG_PATH, stderr=_FFmpegStderrLogger(), **FFMPEG_OPTIONS)
 	logger.debug(f"Starting playback with FFmpeg")
 	voice_client.play(source, after=_on_playback_error)
 	logger.info(f"🎵  Now playing \"{title}\" (requested by @{interaction.user}) 🎵")
@@ -205,7 +248,7 @@ async def play(interaction: discord.Interaction, url: str):
 @tree.command(name="leave-voice-chat", description="Stops playback and disconnects the bot from the voice channel.")
 async def stop(interaction: discord.Interaction):
 	"""Stops audio playback and disconnects the bot from the voice channel."""
-	logger.info(f"@{interaction.user} used /leave-voice-chat")
+	logger.info(f"🕹️   @{interaction.user} used /leave-voice-chat 🕹️")
 	voice_client = interaction.guild.voice_client
 
 	# Verify the bot is actually connected before attempting to stop

@@ -274,3 +274,6 @@ $RECYCLE.BIN/
 
 # Project External Dependencies
 dependencies/
+
+# Logs
+logs/
