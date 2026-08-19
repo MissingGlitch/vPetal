@@ -34,3 +34,15 @@ YDL_OPTIONS = {
 	"js_runtimes": {"deno": {"path": DENO_PATH}},
 	"extractor_args": {"youtube": {"player_client": ["tv_downgraded", "web_embedded", "tv"]}},
 }
+
+#* Search-only configuration:
+# Used when /play receives a plain search term instead of a direct URL.
+# "extract_flat" skips resolving each candidate's playable audio format
+# (no JS-challenge solving needed per result), so listing 20 candidates
+# stays fast. The real playable stream URL is resolved separately, only
+# for the single video the user ends up selecting.
+SEARCH_YDL_OPTIONS = {
+	"quiet": True,
+	"logger": _YtDlpLogger(),
+	"extract_flat": "in_playlist",
+}

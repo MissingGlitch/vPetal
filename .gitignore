@@ -277,3 +277,6 @@ dependencies/
 
 # Logs
 logs/
+
+# Testing
+test.py
