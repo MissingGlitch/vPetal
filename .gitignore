@@ -272,5 +272,5 @@ $RECYCLE.BIN/
 
 
 
-# FFMPEG binaries
-ffmpeg/
+# Project External Dependencies
+dependencies/
