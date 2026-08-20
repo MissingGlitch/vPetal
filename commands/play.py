@@ -17,9 +17,9 @@ URL_PATTERN = re.compile(r"^https?://", re.IGNORECASE)
 
 # View limits to 40 total children in a LayoutView. Each result now costs
 # 1 Container (thumbnail + text + button) instead of 1 button, so results
-# per page must drop from 4 to 3 to keep thumbnails from overwhelming the
+# per page must drop from 4 to 2 to keep thumbnails from overwhelming the
 # message's vertical space.
-RESULTS_PER_PAGE = 3
+RESULTS_PER_PAGE = 2
 SEARCH_TIMEOUT = 60  # seconds before the search results view disables itself
 
 
@@ -48,12 +48,12 @@ class _FFmpegStderrLogger:
 				logger.error(f"[FFMPEG] {line}")
 
 
-def _format_duration(seconds):
-	"""Formats a duration in seconds as MM:SS, e.g. 203 -> '3:23'."""
+def _format_duration_long(seconds):
+	"""Formats a duration in seconds as "M min S s", e.g. 94 -> '1 min 34 s'."""
 	if not seconds:
-		return "?:??"
+		return "?"
 	minutes, secs = divmod(int(seconds), 60)
-	return f"{minutes}:{secs:02d}"
+	return f"{minutes} min {secs} s"
 
 
 def _truncate(text, max_len):
@@ -83,12 +83,40 @@ def _build_result_content(index, entry):
 	video_url = entry.get("url") or entry.get("webpage_url")
 	channel = entry.get("channel") or entry.get("uploader") or "Unknown"
 	channel_url = entry.get("channel_url") or entry.get("uploader_url")
-	duration = _format_duration(entry.get("duration"))
+	duration = _format_duration_long(entry.get("duration"))
 
 	title_part = f"[{title}]({video_url})" if video_url else title
 	channel_part = f"[{channel}]({channel_url})" if channel_url else channel
 
 	return f"### #{index}: {title_part}\n👤 By: {channel_part} | ⏳ `{duration}`"
+
+
+def _build_now_playing_embed(info, interaction: discord.Interaction):
+	"""Builds the "Now playing" embed shown after a track starts, following
+	ejemplo-de-referencia.json: a classic v1 Embed (not Components V2), with
+	the title linked to the video, the channel linked to its own page, and
+	the duration. Field names are a single space instead of the real label,
+	since a non-empty field name gets rendered in bold automatically and we
+	don't want that."""
+	title = info.get("title") or "Unknown title"
+	video_url = info.get("webpage_url") or info.get("url")
+	channel = info.get("channel") or info.get("uploader") or "Unknown"
+	channel_url = info.get("channel_url") or info.get("uploader_url")
+	duration = _format_duration_long(info.get("duration"))
+	image_url = _get_thumbnail_url(info)
+
+	title_part = f"[{title}]({video_url})" if video_url else title
+	channel_part = f"[{channel}]({channel_url})" if channel_url else channel
+
+	embed = discord.Embed(description=f"**{title_part}**")
+	embed.title = "🎵 Now playing:"
+	embed.add_field(name=" ", value=f"👤 By: {channel_part}", inline=True)
+	embed.add_field(name=" ", value=f"⏳`{duration}`", inline=True)
+	embed.set_thumbnail(url="https://i.imgur.com/XCf9DRl.gif")
+	if image_url:
+		embed.set_image(url=image_url)
+	embed.set_footer(text=f"Song requested by @{interaction.user}", icon_url=interaction.user.display_avatar.url)
+	return embed
 
 
 # Tracks the currently active playback "generation" per guild: incremented
@@ -98,11 +126,14 @@ def _build_result_content(index, entry):
 _playback_generation = {}
 
 
-async def _play_track(interaction: discord.Interaction, voice_channel: discord.VoiceChannel, audio_url: str, title: str):
+async def _play_track(interaction: discord.Interaction, voice_channel: discord.VoiceChannel, info: dict):
 	"""Shared playback logic for both direct-URL and search-selection flows:
 	connects/moves to the voice channel, stops any currently playing audio,
 	and starts streaming the given track on an indefinite loop (the same
 	track keeps restarting on its own until a new /play call replaces it)."""
+	audio_url = info["url"]
+	title = info.get("title", "Unknown title")
+
 	if interaction.guild.voice_client is None:
 		logger.debug(f"Connecting to voice channel \"{voice_channel}\"")
 		voice_client = await voice_channel.connect()
@@ -146,7 +177,7 @@ async def _play_track(interaction: discord.Interaction, voice_channel: discord.V
 	_play_source()
 	logger.info(f"🎵  Now playing \"{title}\" on loop (requested by @{interaction.user}) 🎵")
 
-	await interaction.followup.send(f"Now playing: **{title}** (looping)")
+	await interaction.followup.send(embed=_build_now_playing_embed(info, interaction))
 
 
 class _SearchResultsView(discord.ui.LayoutView):
@@ -238,7 +269,17 @@ class _SearchResultsView(discord.ui.LayoutView):
 			logger.info(f"@{interaction.user} clicked \"Play this video\" on \"{entry.get('title') or 'Unknown title'}\" (search: \"{self.query}\")")
 			self.stop()
 			self._disable_all_buttons()
-			await interaction.response.edit_message(view=self)
+			# Edited directly on the message object (not via interaction.response),
+			# so the interaction's own initial response stays free to be the
+			# native "thinking" placeholder below instead of being consumed here.
+			await self.message.edit(view=self)
+
+			# Native ephemeral "thinking" placeholder for this specific click,
+			# only visible to the user who clicked, while the real stream URL
+			# is resolved. This IS the interaction's original response now, so
+			# delete_original_response() below correctly targets it (and not
+			# the results picker, which was edited separately above).
+			await interaction.response.defer(thinking=True, ephemeral=True)
 
 			# The search extraction is "flat" and has no playable stream URL,
 			# so we resolve the real one now, only for the picked video.
@@ -246,11 +287,21 @@ class _SearchResultsView(discord.ui.LayoutView):
 			logger.debug(f"Resolving playable stream for selected result \"{entry.get('title')}\"...")
 			with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
 				info = ydl.extract_info(video_url, download=False)
-				audio_url = info["url"]
-				title = info.get("title", "Unknown title")
-			logger.debug(f"Extraction complete: title=\"{title}\"")
+			logger.debug(f"Extraction complete: title=\"{info.get('title', 'Unknown title')}\"")
+			title = info.get("title", "Unknown title")
 
-			await _play_track(interaction, self.voice_channel, audio_url, title)
+			# Turn the ephemeral "thinking" placeholder into a confirmation
+			# message instead of deleting it, so the user who clicked still
+			# has visual confirmation the extraction succeeded, right before
+			# the public "Now playing" embed is sent. If the user already
+			# dismissed it themselves, Discord returns a 404/NotFound: safe to ignore.
+			title_link = f"{title}"
+			try:
+				await interaction.edit_original_response(content=f"🎵 Audio obtained successfully. Playing: **{title_link}**")
+			except discord.HTTPException:
+				logger.debug(f"Ephemeral \"thinking\" placeholder for @{interaction.user} was already gone before editing")
+
+			await _play_track(interaction, self.voice_channel, info)
 
 		return _callback
 
@@ -288,7 +339,7 @@ class _SearchResultsView(discord.ui.LayoutView):
 	async def on_timeout(self):
 		logger.debug(f"Search results view for @{self.author} expired without a selection")
 		self.clear_items()
-		self.add_item(discord.ui.TextDisplay("Search expired."))
+		self.add_item(discord.ui.TextDisplay(f"ℹ️ Search skipped. {SEARCH_TIMEOUT} seconds passed without any option being selected."))
 		if self.message is not None:
 			try:
 				await self.message.edit(view=self)
@@ -324,11 +375,9 @@ def setup(tree: discord.app_commands.CommandTree):
 			logger.debug(f"Extracting audio info for \"{query}\" via yt-dlp...")
 			with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
 				info = ydl.extract_info(query, download=False)
-				audio_url = info["url"]
-				title = info.get("title", "Unknown title")
-			logger.debug(f"Extraction complete: title=\"{title}\"")
+			logger.debug(f"Extraction complete: title=\"{info.get('title', 'Unknown title')}\"")
 
-			await _play_track(interaction, voice_channel, audio_url, title)
+			await _play_track(interaction, voice_channel, info)
 			return
 
 		# Case 2: plain search term, search YouTube and let the user pick
