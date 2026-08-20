@@ -1,7 +1,7 @@
 # vPetal — Project Context
 
-- **Last Updated:** Wednesday, 19/08/2026
-- **Status:** In active development (Logging Overhaul + Search Feature Phase — core audio pipeline confirmed healthy; laptop-side playback issue deferred to next session)
+- **Last Updated:** Thursday, 20/08/2026
+- **Status:** In active development (Now Playing Redesign Phase — Components V2 search/results/now-playing UI complete; in-Discord error reporting deferred to next session)
 
 ---
 
@@ -66,25 +66,25 @@ The `.env` file is excluded from Git tracking via `.gitignore`.
 ## Directory Structure
 ```plaintext
 vPetal/
-├── .venv/				← Python virtual environment			(Git-ignored)
+├── .venv/					← Python virtual environment			(Git-ignored)
 ├── dependencies/
-│   ├── ffmpeg.exe		← Portable FFmpeg binary for Windows	(Git-ignored)
-│   └── deno.exe		← Portable Deno binary for Windows		(Git-ignored)
+│   ├── ffmpeg.exe			← Portable FFmpeg binary for Windows	(Git-ignored)
+│   └── deno.exe			← Portable Deno binary for Windows		(Git-ignored)
 ├── commands/
-│   ├── __init__.py	← Empty; marks the folder as an importable package
-│   ├── play.py		← /play command: URL/search detection, search pagination UI, playback
-│   └── leave.py	← /leave-voice-chat command
+│   ├── __init__.py			← Empty; marks the folder as an importable package
+│   ├── play.py				← /play command
+│   └── leave.py			← /leave-voice-chat command
 ├── utils/
-│   ├── __init__.py	← Empty; marks the folder as an importable package
-│   ├── paths.py	← FFMPEG_PATH / DENO_PATH resolution (frozen .exe vs dev script)
-│   ├── logger.py	← "vPetal" logger, emoji formatter, rotating file handlers
-│   └── youtube.py	← YDL_OPTIONS / SEARCH_YDL_OPTIONS, _YtDlpLogger bridge
+│   ├── __init__.py			← Empty; marks the folder as an importable package
+│   ├── paths.py			← FFMPEG_PATH / DENO_PATH resolution
+│   ├── logger.py			← "vPetal" custom logger
+│   └── youtube.py			← YDL_OPTIONS / SEARCH_YDL_OPTIONS
 ├── logs/
-│   ├── all.log(.1)(.2)		← All log levels, rotated (max 3 files, 2 MB each)	(Git-ignored)
-│   └── errors.log(.1)(.2)	← WARNING/ERROR only, rotated (max 3 files, 2 MB each)	(Git-ignored)
-├── main.py				← Bot entry point (client, tree, on_ready, command registration)
-├── ffmpeg_debug.log	← Temporary debug file						(Git-ignored, diagnostic only)
-├── .env				← Secret environment variables				(Git-ignored)
+│   ├── all.log(.1)(.2)		← All log levels, rotated 		(max 3 files, 1 MB each)	(Git-ignored)
+│   └── errors.log(.1)(.2)	← WARNING/ERROR only, rotated 	(max 3 files, 1 MB each)	(Git-ignored)
+├── main.py					← Bot entry point
+├── ffmpeg_debug.log		← Temporary debug file				(Git-ignored, diagnostic only)
+├── .env					← Secret environment variables		(Git-ignored)
 ├── .gitignore
 ├── context/
 │   ├── context.md						← This context documentation file
@@ -131,11 +131,11 @@ This combination was manually validated via CLI and confirmed to resolve `n=`/`s
 
 `/play` still passes a custom `stderr=` writer object to `FFmpegPCMAudio`, but it now writes formatted `ERROR`-level log lines (via the `vPetal` logger, through `_FFmpegErrorLogger.write()`) instead of a raw debug file, and truncates long stream URLs (e.g. `googlevideo.com` links) with a regex before logging, so ffmpeg failures (e.g. `HTTP error 403 Forbidden`) now appear live in the console **and** in `logs/errors.log`, formatted like every other log line. This works because passing an object without a real `.fileno()` forces discord.py's `piping_stderr` path, which reads ffmpeg's stderr through an internal pipe/thread instead of handing it directly to the OS as a raw file descriptor. The old plain-file (`ffmpeg_debug.log`) approach is still present as a leftover and should be removed once the new approach is fully validated.
 
-### 6. Custom Logging Layer (`utils/logger.py`) — significantly expanded today
+### 6. Custom Logging Layer (`utils/logger.py`)
 
 * **Format:** every log line now shows an emoji (ℹ️ INFO, 📄 DEBUG, ⚠️ WARNING, ❌ ERROR) followed by `DD/MM/YYYY HH:MM:SS AM/PM [LEVEL] logger_name: message`, via a custom `logging.Formatter` subclass.
 * **Duplicate line fix:** `client.run(TOKEN, log_handler=None)` disables discord.py's own default `setup_logging()` (which otherwise adds a second, differently-formatted handler to the `discord` logger).
-* **File output:** two `logging.handlers.RotatingFileHandler` instances write to `logs/all.log` (every level) and `logs/errors.log` (WARNING/ERROR only), each capped at 2 MB and rotated up to 3 files total (current file + 2 backups; oldest is discarded once the 3rd fills up), attached to both the `vPetal` and `discord` loggers.
+* **File output:** two `logging.handlers.RotatingFileHandler` instances write to `logs/all.log` (every level) and `logs/errors.log` (WARNING/ERROR only), each capped at 1 MB and rotated up to 3 files total (current file + 2 backups; oldest is discarded once the 3rd fills up), attached to both the `vPetal` and `discord` loggers.
 * **yt-dlp bridge:** a `_YtDlpLogger` class (passed as `YDL_OPTIONS["logger"]`) routes yt-dlp's internal `debug`/`warning`/`error` calls through the same `vPetal` logger/formatter, confirmed end-to-end with the DRM warning case (verified against yt-dlp's own `report_warning`/`to_screen` source by a cross-investigation with yt-dlp's AI).
 * **Low-level diagnostics commented out by default:** `discord.voice_state` (low-level voice protocol) and `discord.gateway` (raw WebSocket/gateway traffic) are left at their default level, with commented-out lines in `utils/logger.py` (each explaining what it shows) that can be uncommented for deep debugging. `discord.player` is also available the same way (shows the exact ffmpeg spawn command).
 
@@ -171,35 +171,70 @@ lines on every loop iteration and occasionally on `/leave-voice-chat` is
 normal, expected behavior of streaming from `googlevideo.com` combined with
 our per-loop process restarts — it is not a bug to chase.
 
+### 8. Components V2 Redesign for Search Results, and Embed-Based "Now Playing" Response
+
+`/play`'s search-results picker was redesigned from a plain `discord.ui.View` with
+text-only buttons into a `discord.ui.LayoutView` using Components V2
+(`Container`, `Section`, `MediaGallery`, `TextDisplay`, `Separator`, `ActionRow`),
+matching a reference design (`ejemplo-de-referencia.json`). Each result now shows
+its thumbnail, a markdown-linked title (`[Title](video_url)`) and channel
+(`[Channel](channel_url)`), and a `▶️ Play this video` accessory button, at
+`RESULTS_PER_PAGE = 2` results per page (dropped from an earlier 3, then 4, to
+keep thumbnails from overwhelming the message given the 40-children-per-view limit).
+
+The final "Now playing" response (for both direct URLs and search selections) was
+redesigned as a classic `discord.Embed` (not Components V2, since the embed needs
+to be non-ephemeral and simple/informational, with no interactive accessory),
+matching a second reference design: linked title, linked channel field, duration
+field (`X min Y s` format, via `_format_duration_long`), the real video thumbnail
+as the large image, a fixed decorative gif (`https://i.imgur.com/XCf9DRl.gif`) as
+the small thumbnail, and a footer showing the *requesting user's* avatar
+(`interaction.user.display_avatar.url`, not the bot's).
+
+**Loading feedback while resolving a search selection:** clicking "Play this
+video" now re-triggers Discord's native "App is thinking..." indicator
+(`interaction.response.defer(thinking=True, ephemeral=True)`) instead of a
+hand-written placeholder message, while `yt_dlp.extract_info()` resolves the
+selected result's playable stream. Once resolved, that same ephemeral message is
+edited in place (`interaction.edit_original_response(content=...)`, not deleted)
+into a confirmation line ("🎵 Audio obtained successfully. Playing: **[Title](link)**"),
+immediately before the public, non-ephemeral "Now playing" embed is sent. Wrapped in
+`try/except discord.HTTPException` in case the user already dismissed that ephemeral
+message beforehand — confirmed via testing that dismissing an ephemeral message
+client-side does **not** delete it server-side, so this exception path is a
+safeguard mainly for the interaction token's ~15-minute expiry window, not for the
+manual-dismiss case.
 
 ---
 
-## What Was Done Today (19/08/2026)
+## What Was Done Today (20/08/2026)
 
-### Logging Overhaul
-* [x] Designed and implemented the final emoji + timestamp log format (`ℹ️/📄/⚠️/❌` + `DD/MM/YYYY HH:MM:SS AM/PM [LEVEL] name: message`) via a custom `logging.Formatter` subclass.
-* [x] Diagnosed and fixed duplicate log lines: `discord.py`'s `Client.run()` was auto-configuring its own default handler; fixed with `client.run(TOKEN, log_handler=None)`.
-* [x] Commented out (rather than deleted) the low-level `discord.voice_state` and `discord.gateway` DEBUG lines, each with an explanatory comment, so they can be re-enabled on demand without re-writing them.
-* [x] Diagnosed why the yt-dlp DRM warning still printed "raw"/unformatted: `YDL_OPTIONS` was missing the `"logger"` option. Added `_YtDlpLogger` (bridging yt-dlp's `debug`/`warning`/`error` into the `vPetal` logger), confirmed correct via a cross-investigation with an AI specialized in yt-dlp (verified against `InfoExtractor.report_warning` and `YoutubeDL.report_warning`/`to_screen` source).
-* [x] Investigated and confirmed (with hard evidence from `discord.py`'s `player.py` source) why FFmpeg's stderr never reached the terminal or the exception object: passing a real file (`open(...)`, which has a working `.fileno()`) makes discord.py hand stderr directly to the OS, bypassing Python entirely. Fixed by replacing the file with a custom writer object (no real `.fileno()`), which activates discord.py's internal `piping_stderr` thread-based path — FFmpeg errors (e.g. `HTTP error 403 Forbidden`) now print live, formatted, through the `vPetal` logger.
-* [x] Added a regex-based truncation of long `googlevideo.com` stream URLs inside the FFmpeg error writer, to keep error lines readable in the console.
-* [x] Implemented dual rotating file logging (`logs/all.log` and `logs/errors.log`, 2 MB max per file, 3 files max per category), attached to both the `vPetal` and `discord` loggers.
-* [x] Fixed a duplicate-logger-setup bug (the entire logger-creation block had been accidentally pasted twice, causing every line to print twice).
+### Search Results UI — Components V2 Redesign
+* [x] Rebuilt `_SearchResultsView` on `discord.ui.LayoutView` with Components V2 (`Container`, `Section`, `MediaGallery`, `TextDisplay`, `Separator`, `ActionRow`), replacing the old plain-button layout, matching a provided reference JSON design.
+* [x] Fixed an `AttributeError: MediaGalleryItem` crash: `discord.ui.MediaGalleryItem` does not exist (`discord/ui/media_gallery.py`'s `__all__` only re-exports `MediaGallery`); the real class lives at `discord.components.MediaGalleryItem`. Added `import discord.components` and switched to the fully-qualified path.
+* [x] Dropped `RESULTS_PER_PAGE` from 4 → 3 → 2 to account for each result now costing a full thumbnail `Container`/`Section` instead of a single button, within the 40-children-per-view limit.
+* [x] Made the search query itself bold/underlined/monospaced (`**__\`query\`__**`) in both the results header and the "No results found" message.
+* [x] Made both the video title and channel name clickable markdown links (`[Title](video_url)`, `[Channel](channel_url)`), with the link scoped only to the title text itself, not the `#N:` index prefix.
+* [x] Switched result durations to the long format (`X min Y s`, via the already-existing `_format_duration_long`) instead of `M:SS`.
+* [x] Improved the timeout message ("Search expired.") to explicitly state how many seconds elapsed (using `SEARCH_TIMEOUT` directly, so it stays in sync if that constant changes).
+* [x] Added logging for every button interaction on the results view (pagination: first/previous/next/last, and result selection), including who clicked and which button.
 
-### Project Restructuring
-* [x] Migrated the codebase from a single `main.py` into `commands/` (`play.py`, `leave.py`) and `utils/` (`paths.py`, `logger.py`, `youtube.py`) packages, each with an `__init__.py` (commented to explain why it exists and why it's empty).
-* [x] Fixed relative-import errors (`ModuleNotFoundError: No module named 'logger'`, etc.) introduced by the move, updating all internal imports to use the `utils.`/`commands.` package prefix.
-* [x] Diagnosed and fixed a path-resolution regression introduced by the move: `utils/paths.py` used `os.path.dirname(os.path.abspath(__file__))` to find the project root, which — now that the file lives one level deeper inside `utils/` — resolved to the wrong directory, silently breaking Deno detection (`DENO_PATH` pointed to a non-existent path) and causing yt-dlp to fall back to PO-Token-requiring clients (`The page needs to be reloaded.` error). Fixed by going up one extra directory level.
+### "Now Playing" Response Redesign
+* [x] Replaced the plain-text "Now playing: **Title**" follow-up with a `discord.Embed`, matching a second provided reference JSON design: linked title/channel, duration field, real video thumbnail as the large image, a fixed decorative gif as the small thumbnail, and a footer with the requesting user's own avatar (fixed from initially using the bot's avatar).
 
-### Search Feature (`/play` with plain search terms)
-* [x] Cross-investigated with an AI specialized in yt-dlp to confirm `ytsearchN:query` syntax, `extract_flat` behavior (avoids resolving playable formats/JS-challenge per candidate, keeping a 20-result search fast), and empty-result behavior (`entries: []`, no exception) — validated with real test output (`test.py`) before writing any code.
-* [x] Implemented URL-vs-search-term detection in `/play` (regex on `http(s)://` prefix).
-* [x] Implemented a paginated, button-only, ephemeral results view (`_SearchResultsView`, `discord.ui.View`): 4 result buttons per page + a 5th navigation row (`⏮` first / `◀` previous / page indicator / `▶` next / `⏭` last), respecting Discord's 5-rows/25-components-per-view limit.
-* [x] Each result button label follows the format `#N: 🔴 Title | 👤 Channel | ⏳ MM:SS`, with a fixed character budget per field (accounting for the 80-character button label limit, a reserved 3-digit index in case the search size increases beyond `ytsearch99`, and `999:59` as the max duration width). The release-year field was designed and then **dropped** after confirming `timestamp`/`release_timestamp` are frequently `null` under `extract_flat` (per yt-dlp's own uncertainty and confirmed with real search output).
-* [x] Restricted interaction to the command's original author (`interaction_check`), and made the results message fully ephemeral.
-* [x] Implemented a 60-second timeout that disables all buttons and edits the message to a "Search expired." state if the user doesn't pick a result.
-* [x] Fixed a missing-callback `AttributeError` (`_go_first`/`_go_last` referenced but not defined) introduced when adding the first/last navigation buttons.
-* [x] Added a proper parameter description (`@discord.app_commands.describe(query=...)`) to `/play`, fixing Discord's UI showing a literal `"…"` placeholder for the `query` field (confirmed as discord.py's default fallback for undocumented parameters).
+### Loading Feedback for Search Selections
+* [x] Investigated and discussed multiple alternatives for giving visual feedback between clicking "Play this video" and the final embed appearing (given extraction takes several seconds), weighing ephemeral-vs-public and single-vs-multiple-message tradeoffs.
+* [x] Implemented Discord's native ephemeral "App is thinking..." indicator on click (`defer(thinking=True, ephemeral=True)`), confirming this only works correctly when the picker's own button-disable edit is done directly via `self.message.edit(...)` rather than consuming the interaction's initial response with `interaction.response.edit_message(...)` (which would otherwise make `delete_original_response()`/`edit_original_response()` target the picker message instead of the "thinking" placeholder).
+* [x] Changed that ephemeral placeholder from being deleted to being edited in place into a "✅ Audio obtained successfully. Playing: **[Title](link)**" confirmation, right before the public "Now playing" embed is sent.
+* [x] Confirmed (via live testing) that manually dismissing an ephemeral message client-side does not delete it server-side — `edit_original_response()` never raised `NotFound` in that scenario; the existing `try/except discord.HTTPException` guard was kept regardless, as a safeguard for interaction-token expiry.
+
+### Loop Playback Feature (implemented, reverted, then re-implemented)
+* [x] Re-implemented infinite single-track looping in `_play_track` (per-guild `_playback_generation` counter to avoid a stale `after()` callback re-triggering playback of a superseded track), after having deliberately shipped the Components V2 redesign as its own commit first, without the loop, to keep commits scoped.
+* [x] Investigated FFmpeg `stderr` noise appearing on every loop iteration and occasionally on `/leave-voice-chat` (`IO error -10054`, `Will reconnect...`), cross-checked with an AI specialized in FFmpeg (reviewing `libavformat/http.c`'s `http_buf_read()` reconnect logic) and with `discord.py`'s own `FFmpegAudio._check_process_returncode()`/`cleanup()` logic. Confirmed these lines are benign (`AV_LOG_WARNING`, process still exits with code 0) and downgraded them from `ERROR` to `WARNING` in `_FFmpegStderrLogger.write()`, keeping only `"Failed to reconnect at"` as a genuine `ERROR`.
+* [x] Documented this benign-noise pattern in `context.md` (see Architecture Decision #7) so it isn't mistaken for a bug in future sessions.
+
+### Logging Configuration
+* [x] Reduced the rotating log file size cap from 2 MB to 1 MB per file (`logs/all.log`, `logs/errors.log`), keeping the same 3-files-per-category retention.
 
 ---
 
@@ -213,7 +248,7 @@ our per-loop process restarts — it is not a bug to chase.
   - Discord client-side feedback/echo suppression triggered by having both the bot and a human listener active from the same local network/device context.
   - Test with the mobile device on the *same* wifi as the bot (instead of mobile data) to try to reproduce the issue there too.
   - Test with a third device (a different laptop/PC) on the bot's network, distinct from the one running the bot.
-* [ ] Remove the leftover `ffmpeg_debug.log` plain-file capture now that FFmpeg errors are captured through the logger.
+* [ ] **Show user-facing error messages in Discord itself** when something fails during playback/extraction — ffmpeg process failures, yt-dlp extraction failures, or any other failure in the audio pipeline — so failures are visible from the Discord client without needing to check the console/log files. Scope this for both the direct-URL flow and the search-selection flow (including a message like `"Could not fetch the video \`title\` (\`link\`)"` when a title is known, or without the parenthetical when it isn't — this was explicitly deferred from the previous session to its own separate commit).
 * [ ] Remove the temporary diagnostic instrumentation added in a previous session (DAVE session `repr()` check and audio packet counter wrapper) once the laptop-side playback issue is resolved.
 * [ ] Decide whether to keep `discord.player`/`discord.voice_state` DEBUG logs enabled/commented for ongoing development.
 
