@@ -1,5 +1,6 @@
 import re
 import discord
+import discord.components
 from utils.logger import logger
 from utils.paths import FFMPEG_PATH
 from utils.youtube import YDL_OPTIONS, SEARCH_YDL_OPTIONS
@@ -14,8 +15,11 @@ FFMPEG_OPTIONS = {
 # as a search term instead.
 URL_PATTERN = re.compile(r"^https?://", re.IGNORECASE)
 
-# View limits to 5 rows max: 4 rows of results + 1 row of navigation buttons.
-RESULTS_PER_PAGE = 4
+# View limits to 40 total children in a LayoutView. Each result now costs
+# 1 Container (thumbnail + text + button) instead of 1 button, so results
+# per page must drop from 4 to 3 to keep thumbnails from overwhelming the
+# message's vertical space.
+RESULTS_PER_PAGE = 3
 SEARCH_TIMEOUT = 60  # seconds before the search results view disables itself
 
 
@@ -48,37 +52,33 @@ def _truncate(text, max_len):
 	return text[: max_len - 1].rstrip() + "…"
 
 
-# Reserved character budgets, sized for worst-case content so the layout
-# stays consistent across all buttons/pages instead of shifting based on
-# each entry's actual (usually shorter) values:
-# - "#999: " -> supports up to a 3-digit result number, in case
-#   RESULTS_PER_PAGE/ytsearchN is ever increased past 99 results.
-# - "999:59" -> supports videos over 16 hours long (extremely unlikely,
-#   but costs nothing to reserve).
-NUMBER_RESERVED = len("#999: ")
-DURATION_RESERVED = len("999:59")
+def _get_thumbnail_url(entry):
+	"""Returns a thumbnail URL for a search entry, falling back to the last
+	(usually highest-resolution) item in "thumbnails" if "thumbnail" itself
+	is missing. Returns None if neither field is present, so the caller can
+	skip the MediaGallery for that specific result instead of guessing."""
+	thumbnail_url = entry.get("thumbnail")
+	if thumbnail_url:
+		return thumbnail_url
+	thumbnails = entry.get("thumbnails") or []
+	return thumbnails[-1]["url"] if thumbnails else None
 
 
-def _build_label(index, entry):
-	"""Builds a button label: '#N: 🔴 Title | 👤 Channel | ⏳ MM:SS',
-	truncated to fit inside Discord's 80-character button label limit."""
-	number = f"#{index}: "
+def _build_result_content(index, entry):
+	"""Builds the markdown text shown next to each result's thumbnail:
+	a heading with the title (linked to the video), followed by the
+	channel (linked to the channel) and duration. The video link only
+	wraps the title itself, not the "#N:" index prefix."""
+	title = entry.get("title") or "Unknown title"
+	video_url = entry.get("url") or entry.get("webpage_url")
+	channel = entry.get("channel") or entry.get("uploader") or "Unknown"
+	channel_url = entry.get("channel_url") or entry.get("uploader_url")
 	duration = _format_duration(entry.get("duration"))
-	duration_part = f" | ⏳ {duration}"
 
-	# Fixed-width parts: number, title emoji, separators, channel emoji,
-	# duration emoji + reserved worst-case width (not the actual duration
-	# length, so the split between title/channel doesn't shift per entry).
-	fixed_len = NUMBER_RESERVED + len("🔴 ") + len(" | 👤 ") + len(" | ⏳ ") + DURATION_RESERVED
-	remaining = max(80 - fixed_len, 20)
-	title_budget = max(remaining * 2 // 3, 10)
-	channel_budget = max(remaining - title_budget, 10)
+	title_part = f"[{title}]({video_url})" if video_url else title
+	channel_part = f"[{channel}]({channel_url})" if channel_url else channel
 
-	title = _truncate(entry.get("title") or "Unknown title", title_budget)
-	channel = _truncate(entry.get("channel") or entry.get("uploader") or "Unknown", channel_budget)
-
-	label = f"{number}🔴 {title} | 👤 {channel}{duration_part}"
-	return label if len(label) <= 80 else label[:79] + "…"
+	return f"### #{index}: {title_part}\n👤 By: {channel_part} | ⏳ `{duration}`"
 
 
 async def _play_track(interaction: discord.Interaction, voice_channel: discord.VoiceChannel, audio_url: str, title: str):
@@ -113,66 +113,96 @@ async def _play_track(interaction: discord.Interaction, voice_channel: discord.V
 	await interaction.followup.send(f"Now playing: **{title}**")
 
 
-class _SearchResultsView(discord.ui.View):
-	"""Paginated search results: up to RESULTS_PER_PAGE buttons (one per
-	video) plus a navigation row ("<" / "Page x/y" / ">"). Restricted to
-	the user who ran /play, and disables itself after SEARCH_TIMEOUT
-	seconds without a selection."""
+class _SearchResultsView(discord.ui.LayoutView):
+	"""Paginated search results using Components V2: up to RESULTS_PER_PAGE
+	result blocks (thumbnail + text + "Play this video" button) plus a
+	navigation row ("<" / "Page x/y" / ">"). Restricted to the user who ran
+	/play, and disables itself after SEARCH_TIMEOUT seconds without a
+	selection."""
 
-	def __init__(self, author: discord.abc.User, entries: list, voice_channel: discord.VoiceChannel):
+	def __init__(self, author: discord.abc.User, entries: list, voice_channel: discord.VoiceChannel, query: str):
 		super().__init__(timeout=SEARCH_TIMEOUT)
 		self.author = author
 		self.entries = entries
 		self.voice_channel = voice_channel
+		self.query = query
 		self.page = 0
 		self.message: discord.InteractionMessage | None = None
 		self.total_pages = max(1, -(-len(entries) // RESULTS_PER_PAGE))  # ceil division
 		self._render_page()
 
 	def _render_page(self):
-		"""Clears and rebuilds every button for the current page."""
+		"""Clears and rebuilds every component for the current page."""
 		self.clear_items()
 		start = self.page * RESULTS_PER_PAGE
 		page_entries = self.entries[start:start + RESULTS_PER_PAGE]
 
+		self.add_item(discord.ui.TextDisplay(f'# 🔍 Search results for: "**__`{self.query}`__**"'))
+
 		for offset, entry in enumerate(page_entries):
 			index = start + offset + 1  # 1-based, keeps counting across pages
-			button = discord.ui.Button(label=_build_label(index, entry), style=discord.ButtonStyle.secondary, row=offset)
+			if offset > 0:
+				self.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.small))
+
+			button = discord.ui.Button(style=discord.ButtonStyle.success, label="Play this video", emoji="▶️")
 			button.callback = self._make_select_callback(entry)
-			self.add_item(button)
+
+			section = discord.ui.Section(_build_result_content(index, entry), accessory=button)
+
+			thumbnail_url = _get_thumbnail_url(entry)
+			if thumbnail_url:
+				gallery = discord.ui.MediaGallery(discord.components.MediaGalleryItem(media=thumbnail_url))
+				self.add_item(discord.ui.Container(gallery, section))
+			else:
+				# No thumbnail available for this entry: skip the MediaGallery
+				# instead of guessing a placeholder URL.
+				self.add_item(discord.ui.Container(section))
 
 		# Navigation row (only needed if there's more than one page)
 		# Order: |first| |previous| |page indicator| |next| |last| = 5 buttons,
-		# exactly filling row 4 (Discord's per-row limit).
+		# exactly filling ActionRow's per-row limit.
 		if self.total_pages > 1:
+			self.add_item(discord.ui.Separator(spacing=discord.SeparatorSpacing.large))
+
 			is_first_page = self.page == 0
 			is_last_page = self.page == self.total_pages - 1
+			nav_row = discord.ui.ActionRow()
 
-			first_button = discord.ui.Button(label="⏮", style=discord.ButtonStyle.primary, row=4, disabled=is_first_page)
+			first_button = discord.ui.Button(label="⏮", style=discord.ButtonStyle.primary, disabled=is_first_page)
 			first_button.callback = self._go_first
-			self.add_item(first_button)
+			nav_row.add_item(first_button)
 
-			previous_button = discord.ui.Button(label="◀", style=discord.ButtonStyle.primary, row=4, disabled=is_first_page)
+			previous_button = discord.ui.Button(label="◀", style=discord.ButtonStyle.primary, disabled=is_first_page)
 			previous_button.callback = self._go_previous
-			self.add_item(previous_button)
+			nav_row.add_item(previous_button)
 
-			page_indicator = discord.ui.Button(label=f"Page {self.page + 1}/{self.total_pages}", style=discord.ButtonStyle.secondary, row=4, disabled=True)
-			self.add_item(page_indicator)
+			page_indicator = discord.ui.Button(label=f"Page {self.page + 1}/{self.total_pages}", style=discord.ButtonStyle.secondary, disabled=True)
+			nav_row.add_item(page_indicator)
 
-			next_button = discord.ui.Button(label="▶", style=discord.ButtonStyle.primary, row=4, disabled=is_last_page)
+			next_button = discord.ui.Button(label="▶", style=discord.ButtonStyle.primary, disabled=is_last_page)
 			next_button.callback = self._go_next
-			self.add_item(next_button)
+			nav_row.add_item(next_button)
 
-			last_button = discord.ui.Button(label="⏭", style=discord.ButtonStyle.primary, row=4, disabled=is_last_page)
+			last_button = discord.ui.Button(label="⏭", style=discord.ButtonStyle.primary, disabled=is_last_page)
 			last_button.callback = self._go_last
-			self.add_item(last_button)
+			nav_row.add_item(last_button)
+
+			self.add_item(nav_row)
+
+	def _disable_all_buttons(self):
+		"""Recursively disables every Button in the view, including those
+		nested inside Sections/ActionRows (unlike the flat button list the
+		old discord.ui.View had via self.children)."""
+		for item in self.walk_children():
+			if isinstance(item, discord.ui.Button):
+				item.disabled = True
 
 	def _make_select_callback(self, entry):
 		async def _callback(interaction: discord.Interaction):
+			logger.info(f"@{interaction.user} clicked \"Play this video\" on \"{entry.get('title') or 'Unknown title'}\" (search: \"{self.query}\")")
 			self.stop()
-			for item in self.children:
-				item.disabled = True
-			await interaction.response.edit_message(content=f"Selected: **{entry.get('title') or 'Unknown title'}**", view=self)
+			self._disable_all_buttons()
+			await interaction.response.edit_message(view=self)
 
 			# The search extraction is "flat" and has no playable stream URL,
 			# so we resolve the real one now, only for the picked video.
@@ -189,21 +219,25 @@ class _SearchResultsView(discord.ui.View):
 		return _callback
 
 	async def _go_first(self, interaction: discord.Interaction):
+		logger.debug(f"@{interaction.user} clicked \"⏮ first page\" on search \"{self.query}\"")
 		self.page = 0
 		self._render_page()
 		await interaction.response.edit_message(view=self)
 
 	async def _go_previous(self, interaction: discord.Interaction):
+		logger.debug(f"@{interaction.user} clicked \"◀ previous page\" on search \"{self.query}\"")
 		self.page -= 1
 		self._render_page()
 		await interaction.response.edit_message(view=self)
 
 	async def _go_next(self, interaction: discord.Interaction):
+		logger.debug(f"@{interaction.user} clicked \"▶ next page\" on search \"{self.query}\"")
 		self.page += 1
 		self._render_page()
 		await interaction.response.edit_message(view=self)
 
 	async def _go_last(self, interaction: discord.Interaction):
+		logger.debug(f"@{interaction.user} clicked \"⏭ last page\" on search \"{self.query}\"")
 		self.page = self.total_pages - 1
 		self._render_page()
 		await interaction.response.edit_message(view=self)
@@ -217,11 +251,11 @@ class _SearchResultsView(discord.ui.View):
 
 	async def on_timeout(self):
 		logger.debug(f"Search results view for @{self.author} expired without a selection")
-		for item in self.children:
-			item.disabled = True
+		self.clear_items()
+		self.add_item(discord.ui.TextDisplay("Search expired."))
 		if self.message is not None:
 			try:
-				await self.message.edit(content="Search expired.", view=self)
+				await self.message.edit(view=self)
 			except discord.HTTPException:
 				pass
 
@@ -271,11 +305,9 @@ def setup(tree: discord.app_commands.CommandTree):
 
 		if not entries:
 			logger.info(f"@{interaction.user} searched \"{query}\" but no results were found")
-			await interaction.followup.send("No results found.", ephemeral=True)
+			await interaction.followup.send(f'No results found for the search: "**__`{query}`__**"', ephemeral=True)
 			return
 
 		logger.info(f"@{interaction.user} searched \"{query}\", {len(entries)} result(s) found")
-		view = _SearchResultsView(interaction.user, entries, voice_channel)
-		view.message = await interaction.followup.send(
-			content=f'Search results for: "{query}"', view=view, ephemeral=True
-		)
+		view = _SearchResultsView(interaction.user, entries, voice_channel, query)
+		view.message = await interaction.followup.send(view=view, ephemeral=True)
