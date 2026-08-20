@@ -35,7 +35,17 @@ class _FFmpegStderrLogger:
 		# so a single ffmpeg error line doesn't flood the terminal/log files.
 		text = re.sub(r"(https://[^\s]{30})[^\s]+", r"\1... [truncated]", text)
 		for line in text.splitlines():
-			logger.error(f"[FFMPEG] {line}")
+			# ffmpeg's own reconnect logic (googlevideo.com closing the TCP
+			# connection at natural stream end, or us killing the process on
+			# purpose) logs these as AV_LOG_WARNING internally, not an actual
+			# failure. Only "Failed to reconnect at" is a genuine AV_LOG_ERROR
+			# (reconnection attempt itself failed), so that one stays as error.
+			if "Failed to reconnect at" in line:
+				logger.error(f"[FFMPEG] {line}")
+			elif "Will reconnect" in line or "Error in the pull function" in line or "IO error" in line:
+				logger.warning(f"[FFMPEG] {line}")
+			else:
+				logger.error(f"[FFMPEG] {line}")
 
 
 def _format_duration(seconds):
@@ -81,10 +91,18 @@ def _build_result_content(index, entry):
 	return f"### #{index}: {title_part}\n👤 By: {channel_part} | ⏳ `{duration}`"
 
 
+# Tracks the currently active playback "generation" per guild: incremented
+# each time _play_track starts a new track, so a stale after() callback
+# from a track that was stopped early (because a newer one took over)
+# can tell it's no longer the active track and must not loop itself.
+_playback_generation = {}
+
+
 async def _play_track(interaction: discord.Interaction, voice_channel: discord.VoiceChannel, audio_url: str, title: str):
 	"""Shared playback logic for both direct-URL and search-selection flows:
 	connects/moves to the voice channel, stops any currently playing audio,
-	and starts streaming the given track."""
+	and starts streaming the given track on an indefinite loop (the same
+	track keeps restarting on its own until a new /play call replaces it)."""
 	if interaction.guild.voice_client is None:
 		logger.debug(f"Connecting to voice channel \"{voice_channel}\"")
 		voice_client = await voice_channel.connect()
@@ -99,18 +117,36 @@ async def _play_track(interaction: discord.Interaction, voice_channel: discord.V
 		logger.debug("Stopping currently playing audio before starting new track")
 		voice_client.stop()
 
-	def _on_playback_error(error):
+	# Bump this guild's playback generation so a late after() callback from
+	# whatever was playing before (if anything) knows it's now stale.
+	guild_id = interaction.guild.id
+	generation = _playback_generation.get(guild_id, 0) + 1
+	_playback_generation[guild_id] = generation
+
+	def _play_source():
+		source = discord.FFmpegPCMAudio(audio_url, executable=FFMPEG_PATH, stderr=_FFmpegStderrLogger(), **FFMPEG_OPTIONS)
+		voice_client.play(source, after=_on_playback_finished)
+
+	def _on_playback_finished(error):
 		if error:
 			logger.error(f"[FFMPEG ERROR] {error}")
-		else:
-			logger.debug(f"Playback of \"{title}\" finished without errors")
+			return
+		# A newer /play call already replaced this track: don't loop a
+		# stale one back into a voice client that's now playing something else.
+		if _playback_generation.get(guild_id) != generation:
+			logger.debug(f"Playback of \"{title}\" was superseded by a newer track, not looping")
+			return
+		if not voice_client.is_connected():
+			logger.debug(f"Voice client disconnected, not looping \"{title}\"")
+			return
+		logger.debug(f"Looping \"{title}\" again")
+		_play_source()
 
-	source = discord.FFmpegPCMAudio(audio_url, executable=FFMPEG_PATH, stderr=_FFmpegStderrLogger(), **FFMPEG_OPTIONS)
 	logger.debug("Starting playback with FFmpeg")
-	voice_client.play(source, after=_on_playback_error)
-	logger.info(f"🎵  Now playing \"{title}\" (requested by @{interaction.user}) 🎵")
+	_play_source()
+	logger.info(f"🎵  Now playing \"{title}\" on loop (requested by @{interaction.user}) 🎵")
 
-	await interaction.followup.send(f"Now playing: **{title}**")
+	await interaction.followup.send(f"Now playing: **{title}** (looping)")
 
 
 class _SearchResultsView(discord.ui.LayoutView):

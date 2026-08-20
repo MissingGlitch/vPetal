@@ -27,7 +27,7 @@ _handler.setFormatter(_formatter)
 
 #* Log file handlers (rotating)
 # Two categories, kept in /logs: "all.log" captures everything (DEBUG+),
-# "errors.log" captures only WARNING/ERROR. Each category rotates at 2 MB
+# "errors.log" captures only WARNING/ERROR. Each category rotates at 1 MB
 # and keeps at most 3 files total (the active file + 2 backups); once the
 # 3rd fills up, the oldest is discarded and a new one takes its place.
 os.makedirs("logs", exist_ok=True)
@@ -35,7 +35,7 @@ os.makedirs("logs", exist_ok=True)
 _all_file_handler = logging.handlers.RotatingFileHandler(
 	filename=os.path.join("logs", "all.log"),
 	encoding="utf-8",
-	maxBytes=2 * 1024 * 1024,  # 2 MiB
+	maxBytes=1 * 1024 * 1024,  # 1 MiB
 	backupCount=2,  # active file + 2 backups = 3 files max
 )
 _all_file_handler.setFormatter(_formatter)
@@ -43,7 +43,7 @@ _all_file_handler.setFormatter(_formatter)
 _errors_file_handler = logging.handlers.RotatingFileHandler(
 	filename=os.path.join("logs", "errors.log"),
 	encoding="utf-8",
-	maxBytes=2 * 1024 * 1024,  # 2 MiB
+	maxBytes=1 * 1024 * 1024,  # 1 MiB
 	backupCount=2,  # active file + 2 backups = 3 files max
 )
 _errors_file_handler.setLevel(logging.WARNING)

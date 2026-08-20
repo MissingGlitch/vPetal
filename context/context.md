@@ -139,6 +139,39 @@ This combination was manually validated via CLI and confirmed to resolve `n=`/`s
 * **yt-dlp bridge:** a `_YtDlpLogger` class (passed as `YDL_OPTIONS["logger"]`) routes yt-dlp's internal `debug`/`warning`/`error` calls through the same `vPetal` logger/formatter, confirmed end-to-end with the DRM warning case (verified against yt-dlp's own `report_warning`/`to_screen` source by a cross-investigation with yt-dlp's AI).
 * **Low-level diagnostics commented out by default:** `discord.voice_state` (low-level voice protocol) and `discord.gateway` (raw WebSocket/gateway traffic) are left at their default level, with commented-out lines in `utils/logger.py` (each explaining what it shows) that can be uncommented for deep debugging. `discord.player` is also available the same way (shows the exact ffmpeg spawn command).
 
+### 7. FFmpeg Reconnect Warnings During Loop/Disconnect — Expected, Benign Noise
+
+When a track finishes naturally (each loop iteration) or when `/leave-voice-chat`
+force-kills the active FFmpeg process, stderr commonly shows a repeating pattern:
+```log
+[tls @ ADDR] Error in the pull function.
+[tls @ ADDR] IO error: Error number -10054 occurred
+[https @ ADDR] Will reconnect at BYTE_OFFSET in 0 second(s), error=Error number -10054 occurred.
+```
+
+**This is expected and benign, confirmed via a cross-investigation with an AI specialized
+in FFmpeg (reviewing `libavformat/http.c`'s `http_buf_read()` reconnect logic):**
+- `googlevideo.com` (the CDN serving the audio stream) closes the underlying TCP
+  connection abruptly (`WSAECONNRESET` / error `-10054`) instead of a clean
+  HTTP/TLS close, both when the stream reaches its natural end and when we
+  force-kill the FFmpeg process ourselves on `/leave-voice-chat`.
+- FFmpeg's own `-reconnect`/`-reconnect_streamed` logic treats this as a
+  `AV_LOG_WARNING` ("Will reconnect..."), not a real failure — the process
+  still exits with `return code 0` right after, and no audio is lost.
+- The only line that would indicate a genuine reconnection failure is
+  `"Failed to reconnect at ..."` (a true `AV_LOG_ERROR`). This has never
+  appeared in this project's logs so far.
+- `_FFmpegStderrLogger.write()` (in `commands/play.py`) already accounts for
+  this: it downgrades lines containing `"Will reconnect"`, `"Error in the
+  pull function"`, or `"IO error"` to `WARNING`, while keeping `"Failed to
+  reconnect at"` (and anything else) as `ERROR`.
+
+**Takeaway for anyone reading the logs:** seeing these `WARNING`-level FFmpeg
+lines on every loop iteration and occasionally on `/leave-voice-chat` is
+normal, expected behavior of streaming from `googlevideo.com` combined with
+our per-loop process restarts — it is not a bug to chase.
+
+
 ---
 
 ## What Was Done Today (19/08/2026)
