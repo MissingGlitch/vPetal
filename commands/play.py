@@ -1,4 +1,6 @@
 import re
+import time
+import asyncio
 import discord
 import discord.components
 from utils.logger import logger
@@ -21,6 +23,15 @@ URL_PATTERN = re.compile(r"^https?://", re.IGNORECASE)
 # message's vertical space.
 RESULTS_PER_PAGE = 2
 SEARCH_TIMEOUT = 60  # seconds before the search results view disables itself
+
+
+# Failsafe against infinite retry loops: if a track's ffmpeg process dies
+# almost instantly (e.g. a 403 from googlevideo.com) instead of playing
+# through, that's treated as a failed attempt, not a natural loop.
+# After MAX_CONSECUTIVE_FAILURES in a row, playback gives up on that track
+# instead of retrying forever.
+MAX_CONSECUTIVE_FAILURES = 10
+MIN_PLAYBACK_SECONDS = 3  # shorter than this before after() fires = treated as a failure, not a real loop
 
 
 # Route ffmpeg's stderr through a custom writer instead of a plain file,
@@ -60,6 +71,13 @@ def _truncate(text, max_len):
 	if len(text) <= max_len:
 		return text
 	return text[: max_len - 1].rstrip() + "…"
+
+
+def _build_error_message(reason: str) -> str:
+	"""Builds the clean, user-facing error text shown in Discord. `reason`
+	should be a short, non-technical sentence; the full traceback/exception
+	stays in the console and log files only, never in this message."""
+	return f"❌ {reason}"
 
 
 def _get_thumbnail_url(entry):
@@ -126,6 +144,11 @@ def _build_now_playing_embed(info, interaction: discord.Interaction):
 _playback_generation = {}
 
 
+# Tracks consecutive playback failures per guild, reset to 0 whenever a
+# track plays past MIN_PLAYBACK_SECONDS or a new /play call starts fresh.
+_consecutive_failures = {}
+
+
 async def _play_track(interaction: discord.Interaction, voice_channel: discord.VoiceChannel, info: dict):
 	"""Shared playback logic for both direct-URL and search-selection flows:
 	connects/moves to the voice channel, stops any currently playing audio,
@@ -153,15 +176,52 @@ async def _play_track(interaction: discord.Interaction, voice_channel: discord.V
 	guild_id = interaction.guild.id
 	generation = _playback_generation.get(guild_id, 0) + 1
 	_playback_generation[guild_id] = generation
+	_consecutive_failures[guild_id] = 0
+
+	# Timestamp of the current playback attempt's start, used to tell a
+	# genuine failure (ffmpeg dying within milliseconds) apart from a
+	# natural loop (the track actually played through).
+	_attempt_started_at = None
 
 	def _play_source():
+		nonlocal _attempt_started_at
+		_attempt_started_at = time.monotonic()
 		source = discord.FFmpegPCMAudio(audio_url, executable=FFMPEG_PATH, stderr=_FFmpegStderrLogger(), **FFMPEG_OPTIONS)
 		voice_client.play(source, after=_on_playback_finished)
 
 	def _on_playback_finished(error):
+		# TEMPORARY diagnostic log: confirms whether "error" actually arrives
+		# as None on a 403-style instant failure (suspected discord.py-side
+		# race between our own loop restart and _check_process_returncode()'s
+		# self._stopped guard). Remove once confirmed either way.
+		logger.debug(f"_on_playback_finished called for \"{title}\" (guild={guild_id}) with error={error!r}")
+
+		elapsed = time.monotonic() - _attempt_started_at if _attempt_started_at is not None else None
+		is_instant_failure = elapsed is not None and elapsed < MIN_PLAYBACK_SECONDS
+
 		if error:
 			logger.error(f"[FFMPEG ERROR] {error}")
+
+		if error or is_instant_failure:
+			_consecutive_failures[guild_id] = _consecutive_failures.get(guild_id, 0) + 1
+			logger.warning(
+				f"Playback attempt for \"{title}\" failed after {elapsed:.2f}s "
+				f"(consecutive failures: {_consecutive_failures[guild_id]}/{MAX_CONSECUTIVE_FAILURES})"
+			)
+		else:
+			_consecutive_failures[guild_id] = 0
+
+		if _consecutive_failures.get(guild_id, 0) >= MAX_CONSECUTIVE_FAILURES:
+			logger.error(f"Giving up on \"{title}\" after {MAX_CONSECUTIVE_FAILURES} consecutive failed attempts, not retrying again")
+			# after() runs in the AudioPlayer's own thread, not the asyncio
+			# event loop, so sending a message here requires scheduling the
+			# coroutine onto the bot's loop instead of a plain "await".
+			asyncio.run_coroutine_threadsafe(
+				interaction.channel.send(_build_error_message(f"Playback of **{title}** failed repeatedly and was stopped. Check the console/logs for details.")),
+				interaction.client.loop,
+			)
 			return
+
 		# A newer /play call already replaced this track: don't loop a
 		# stale one back into a voice client that's now playing something else.
 		if _playback_generation.get(guild_id) != generation:
@@ -175,7 +235,7 @@ async def _play_track(interaction: discord.Interaction, voice_channel: discord.V
 
 	logger.debug("Starting playback with FFmpeg")
 	_play_source()
-	logger.info(f"🎵  Now playing \"{title}\" on loop (requested by @{interaction.user}) 🎵")
+	logger.info(f"🎵  Now playing \"{title}\" on loop (requested by @{interaction.user}) 🎵", extra={"channel_notify": True})
 
 	await interaction.followup.send(embed=_build_now_playing_embed(info, interaction))
 
@@ -285,9 +345,26 @@ class _SearchResultsView(discord.ui.LayoutView):
 			# so we resolve the real one now, only for the picked video.
 			video_url = entry.get("url") or entry.get("webpage_url")
 			logger.debug(f"Resolving playable stream for selected result \"{entry.get('title')}\"...")
-			with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
-				info = ydl.extract_info(video_url, download=False)
-			logger.debug(f"Extraction complete: title=\"{info.get('title', 'Unknown title')}\"")
+			fallback_title = entry.get("title") or "Unknown title"
+			try:
+				with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
+					info = ydl.extract_info(video_url, download=False)
+				logger.debug(f"Extraction complete: title=\"{info.get('title', 'Unknown title')}\"")
+			except yt_dlp.utils.DownloadError as e:
+				logger.error(f"[YT-DLP] Failed to resolve \"{video_url}\": {e}")
+				try:
+					await interaction.edit_original_response(content=_build_error_message(f"Could not fetch the video **{fallback_title}**. It may be unavailable or region-locked."))
+				except discord.HTTPException:
+					logger.debug(f"Ephemeral placeholder for @{interaction.user} was already gone before editing")
+				return
+			except Exception as e:
+				logger.exception(f"Unexpected error resolving \"{video_url}\"")
+				try:
+					await interaction.edit_original_response(content=_build_error_message(f"Something unexpected went wrong while fetching **{fallback_title}**."))
+				except discord.HTTPException:
+					logger.debug(f"Ephemeral placeholder for @{interaction.user} was already gone before editing")
+				return
+
 			title = info.get("title", "Unknown title")
 
 			# Turn the ephemeral "thinking" placeholder into a confirmation
@@ -295,13 +372,25 @@ class _SearchResultsView(discord.ui.LayoutView):
 			# has visual confirmation the extraction succeeded, right before
 			# the public "Now playing" embed is sent. If the user already
 			# dismissed it themselves, Discord returns a 404/NotFound: safe to ignore.
-			title_link = f"{title}"
 			try:
-				await interaction.edit_original_response(content=f"🎵 Audio obtained successfully. Playing: **{title_link}**")
+				await interaction.edit_original_response(content=f"🎵 Audio obtained successfully. Playing: **{title}**")
 			except discord.HTTPException:
 				logger.debug(f"Ephemeral \"thinking\" placeholder for @{interaction.user} was already gone before editing")
 
-			await _play_track(interaction, self.voice_channel, info)
+			try:
+				await _play_track(interaction, self.voice_channel, info)
+			except discord.ClientException as e:
+				logger.error(f"[VOICE] Failed to start playback for \"{title}\": {e}")
+				try:
+					await interaction.edit_original_response(content=_build_error_message(f"Could not join the voice channel or start playback for **{title}**."))
+				except discord.HTTPException:
+					logger.debug(f"Ephemeral placeholder for @{interaction.user} was already gone before editing")
+			except Exception as e:
+				logger.exception(f"Unexpected error starting playback for \"{title}\"")
+				try:
+					await interaction.edit_original_response(content=_build_error_message(f"Something unexpected went wrong while trying to play **{title}**."))
+				except discord.HTTPException:
+					logger.debug(f"Ephemeral placeholder for @{interaction.user} was already gone before editing")
 
 		return _callback
 
@@ -357,7 +446,7 @@ def setup(tree: discord.app_commands.CommandTree):
 		"""Joins the caller's voice channel and streams audio from the given
 		URL, or shows paginated search results to pick from."""
 		# Log command usage: who invoked it, and with which query
-		logger.info(f"🕹️   @{interaction.user} used /play with query=\"{query}\" in guild=\"{interaction.guild}\" 🕹️")
+		logger.info(f"🕹️   @{interaction.user} used /play with query=\"{query}\" in guild=\"{interaction.guild}\" 🕹️", extra={"channel_notify": True})
 
 		# Verify the user is currently in a voice channel
 		if interaction.user.voice is None:
@@ -373,20 +462,47 @@ def setup(tree: discord.app_commands.CommandTree):
 			await interaction.response.defer()
 
 			logger.debug(f"Extracting audio info for \"{query}\" via yt-dlp...")
-			with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
-				info = ydl.extract_info(query, download=False)
-			logger.debug(f"Extraction complete: title=\"{info.get('title', 'Unknown title')}\"")
+			try:
+				with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
+					info = ydl.extract_info(query, download=False)
+				logger.debug(f"Extraction complete: title=\"{info.get('title', 'Unknown title')}\"")
+			except yt_dlp.utils.DownloadError as e:
+				logger.error(f"[YT-DLP] Failed to extract \"{query}\": {e}")
+				await interaction.followup.send(_build_error_message(f"Could not fetch that URL (`{query}`). It may be invalid, private, or unavailable."))
+				return
+			except Exception as e:
+				logger.exception(f"Unexpected error extracting \"{query}\"")
+				await interaction.followup.send(_build_error_message(f"Something unexpected went wrong while processing `{query}`."))
+				return
 
-			await _play_track(interaction, voice_channel, info)
+			try:
+				await _play_track(interaction, voice_channel, info)
+			except discord.ClientException as e:
+				logger.error(f"[VOICE] Failed to start playback for \"{query}\": {e}")
+				await interaction.followup.send(_build_error_message(f"Could not join the voice channel or start playback for **{info.get('title', query)}**."))
+			except discord.HTTPException as e:
+				logger.error(f"[DISCORD] HTTP error while starting playback for \"{query}\": {e}")
+			except Exception as e:
+				logger.exception(f"Unexpected error starting playback for \"{query}\"")
+				await interaction.followup.send(_build_error_message(f"Something unexpected went wrong while trying to play **{info.get('title', query)}**."))
 			return
 
 		# Case 2: plain search term, search YouTube and let the user pick
 		await interaction.response.defer(ephemeral=True)
 
 		logger.debug(f"Searching YouTube for \"{query}\" via yt-dlp...")
-		with yt_dlp.YoutubeDL(SEARCH_YDL_OPTIONS) as ydl:
-			results = ydl.extract_info(f"ytsearch20:{query}", download=False)
-			entries = results.get("entries") or []
+		try:
+			with yt_dlp.YoutubeDL(SEARCH_YDL_OPTIONS) as ydl:
+				results = ydl.extract_info(f"ytsearch20:{query}", download=False)
+				entries = results.get("entries") or []
+		except yt_dlp.utils.DownloadError as e:
+			logger.error(f"[YT-DLP] Search failed for \"{query}\": {e}")
+			await interaction.followup.send(_build_error_message(f"Could not search for \"**{query}**\" right now. Try again in a moment."), ephemeral=True)
+			return
+		except Exception as e:
+			logger.exception(f"Unexpected error searching \"{query}\"")
+			await interaction.followup.send(_build_error_message("Something unexpected went wrong while searching."), ephemeral=True)
+			return
 
 		if not entries:
 			logger.info(f"@{interaction.user} searched \"{query}\" but no results were found")

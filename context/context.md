@@ -1,7 +1,7 @@
 # vPetal — Project Context
 
-- **Last Updated:** Thursday, 20/08/2026
-- **Status:** In active development (Now Playing Redesign Phase — Components V2 search/results/now-playing UI complete; in-Discord error reporting deferred to next session)
+- **Last Updated:** Friday, 21/08/2026
+- **Status:** In active development (Error Handling & Discord Log Mirroring Phase — playback failsafe, in-Discord error messages, and Discord-mirrored logging channel/thread all complete)
 
 ---
 
@@ -16,7 +16,7 @@ A Discord music bot featuring slash commands (`/play` and `/leave-voice-chat`). 
 | Element | Detail |
 |---|---|
 | Operating System | Windows 11 (64-bit) |
-| Terminal / Shell | PowerShell (both tested, behave identically for this project) |
+| Terminal / Shell | PowerShell |
 | Language | Python 3.14 (64-bit) |
 | Virtual Environment | `.venv/` in the project root |
 | Code Editor | Visual Studio Code |
@@ -56,9 +56,12 @@ All portable executables live together in a single `dependencies/` directory:
 
 ## Environment Variables (`.env`)
 
-BOT_TOKEN     = <discord_bot_token>
-DEV_GUILD_ID  = <test_server_id>
-
+```plaintext
+BOT_TOKEN         = <discord_bot_token>
+DEV_GUILD_ID      = <test_server_id>
+LOGS_CHANNEL_ID   = <discord_channel_id>  # mirrors command usage + startup-ready + all WARNING/ERROR logs
+ERRORS_THREAD_ID  = <discord_thread_id>   # thread inside that same channel; mirrors WARNING/ERROR logs only
+```
 The `.env` file is excluded from Git tracking via `.gitignore`.
 
 ---
@@ -205,36 +208,98 @@ client-side does **not** delete it server-side, so this exception path is a
 safeguard mainly for the interaction token's ~15-minute expiry window, not for the
 manual-dismiss case.
 
+### 9. Playback Failure Failsafe: Consecutive-Failure Cap Instead of Infinite Retry
+
+The single-track loop in `_play_track` (`commands/play.py`) previously had no limit on how
+many times it would restart playback after `voice_client.play(after=_on_playback_finished)`
+finished. During testing (forcing an `android_vr` 403 on purpose), this produced an infinite
+loop: FFmpeg died in milliseconds each time, but `_on_playback_finished` received `error=None`
+on every call — investigated and narrowed to a discord.py-side interaction between
+`_check_process_returncode()`'s `self._stopped` guard and our own rapid `voice_client.play()`
+restarts, though the exact mechanism was not fully confirmed (would require reading
+`VoiceClient.play()`/`stop()` in full).
+
+**Decision:** instead of relying on `error` being correctly populated, failures are now
+detected by elapsed time: if `after()` fires less than `MIN_PLAYBACK_SECONDS` (3s) after the
+track started, that attempt counts as a failure regardless of what `error` contains. A
+per-guild `_consecutive_failures` counter gives up after `MAX_CONSECUTIVE_FAILURES` (10)
+in a row, logging `"Giving up on ... after 10 consecutive failed attempts"` and notifying
+the channel the track was playing in, instead of looping forever. The counter resets to 0
+once a track plays past that 3-second threshold.
+
+### 10. In-Discord Error Messages
+
+Every yt-dlp extraction call (`ydl.extract_info(...)`, both for direct URLs and search) and
+every call into `_play_track` is now wrapped in `try/except`, catching `yt_dlp.utils.DownloadError`
+and `discord.ClientException` specifically (with a tailored message), plus a generic
+`except Exception` as a final safety net (logged with `logger.exception(...)` for the full
+traceback, shown to the user as a generic "something unexpected went wrong" message). A small
+`_build_error_message(reason)` helper (`commands/play.py`) standardizes the ❌-prefixed,
+non-technical text shown to the user — the full technical detail (stack trace, yt-dlp/ffmpeg
+raw output) stays in the console and log files only, never in the Discord-facing message.
+
+### 11. Discord Channel/Thread Log Mirroring
+
+`utils/logger.py` now mirrors selected log records live into a real Discord channel
+(`LOGS_CHANNEL_ID`) and a thread inside it (`ERRORS_THREAD_ID`), via a custom
+`_DiscordHandler(logging.Handler)`:
+* The **channel** receives every `WARNING`/`ERROR` record, plus any record explicitly marked
+  with `extra={"channel_notify": True}` — currently only the startup-ready line and the two
+  command-usage lines (`/play`, `/leave-voice-chat`).
+* The **thread** receives only `WARNING`/`ERROR` records (no filter needed beyond `setLevel`).
+* Since `logger.error(...)`/`logger.warning(...)` calls can happen from any thread (e.g. the
+  `AudioPlayer` thread via `_FFmpegStderrLogger`), `_DiscordHandler.emit()` never `await`s
+  directly — it schedules the actual `channel.send(...)`/`thread.send(...)` onto the bot's
+  asyncio loop via `asyncio.run_coroutine_threadsafe(...)`, resolved once in `on_ready` via
+  `set_discord_destinations(client, logs_channel, errors_thread)` (uses `get_channel()` first,
+  falling back to `fetch_channel()` if not cached).
+* Messages are wrapped in a code block (```` ``` ````) and **truncated** (not split) to 1900
+  characters before wrapping, keeping every mirrored message under Discord's 2000-character
+  limit. A separate, undecorated `vPetal.discord_mirror` logger reports mirroring failures
+  (e.g. missing permissions, deleted channel) to console/`errors.log` only, deliberately
+  without a Discord handler attached, to avoid a feedback loop.
+* Ordering constraint: the `_DiscordHandler`/`_ChannelFilter`/`_channel_handler`/`_thread_handler`
+  definitions must appear in the file **before** `logger.addHandler(_channel_handler)` — this
+  caused a real `NameError` during implementation from defining them out of order.
+
 ---
 
-## What Was Done Today (20/08/2026)
+## What Was Done Today (21/08/2026)
 
-### Search Results UI — Components V2 Redesign
-* [x] Rebuilt `_SearchResultsView` on `discord.ui.LayoutView` with Components V2 (`Container`, `Section`, `MediaGallery`, `TextDisplay`, `Separator`, `ActionRow`), replacing the old plain-button layout, matching a provided reference JSON design.
-* [x] Fixed an `AttributeError: MediaGalleryItem` crash: `discord.ui.MediaGalleryItem` does not exist (`discord/ui/media_gallery.py`'s `__all__` only re-exports `MediaGallery`); the real class lives at `discord.components.MediaGalleryItem`. Added `import discord.components` and switched to the fully-qualified path.
-* [x] Dropped `RESULTS_PER_PAGE` from 4 → 3 → 2 to account for each result now costing a full thumbnail `Container`/`Section` instead of a single button, within the 40-children-per-view limit.
-* [x] Made the search query itself bold/underlined/monospaced (`**__\`query\`__**`) in both the results header and the "No results found" message.
-* [x] Made both the video title and channel name clickable markdown links (`[Title](video_url)`, `[Channel](channel_url)`), with the link scoped only to the title text itself, not the `#N:` index prefix.
-* [x] Switched result durations to the long format (`X min Y s`, via the already-existing `_format_duration_long`) instead of `M:SS`.
-* [x] Improved the timeout message ("Search expired.") to explicitly state how many seconds elapsed (using `SEARCH_TIMEOUT` directly, so it stays in sync if that constant changes).
-* [x] Added logging for every button interaction on the results view (pagination: first/previous/next/last, and result selection), including who clicked and which button.
+### Error Capture Testing
+* [x] Devised and ran a battery of manual failure tests against `/play` and `/leave-voice-chat`
+  (invalid/unresolvable URL, no-results search, forced `android_vr` 403 loop, among others) to
+  confirm no test crashes the bot process and every failure is at least visible in the console/logs.
+* [x] Confirmed the infinite-retry-loop bug during the forced-403 test: `_on_playback_finished`
+  received `error=None` on every iteration despite FFmpeg dying instantly each time.
 
-### "Now Playing" Response Redesign
-* [x] Replaced the plain-text "Now playing: **Title**" follow-up with a `discord.Embed`, matching a second provided reference JSON design: linked title/channel, duration field, real video thumbnail as the large image, a fixed decorative gif as the small thumbnail, and a footer with the requesting user's own avatar (fixed from initially using the bot's avatar).
+### Playback Failsafe
+* [x] Added `MAX_CONSECUTIVE_FAILURES` (10) and `MIN_PLAYBACK_SECONDS` (3) constants and a
+  per-guild `_consecutive_failures` counter to `_play_track`/`_on_playback_finished`, so a track
+  that keeps failing near-instantly gives up after 10 attempts instead of looping forever,
+  independent of whether `error` itself is populated correctly.
+* [x] Added a diagnostic log line (`_on_playback_finished called ... with error={error!r}`) that
+  confirmed the `error=None` root cause empirically; kept as a permanent debug-level line.
 
-### Loading Feedback for Search Selections
-* [x] Investigated and discussed multiple alternatives for giving visual feedback between clicking "Play this video" and the final embed appearing (given extraction takes several seconds), weighing ephemeral-vs-public and single-vs-multiple-message tradeoffs.
-* [x] Implemented Discord's native ephemeral "App is thinking..." indicator on click (`defer(thinking=True, ephemeral=True)`), confirming this only works correctly when the picker's own button-disable edit is done directly via `self.message.edit(...)` rather than consuming the interaction's initial response with `interaction.response.edit_message(...)` (which would otherwise make `delete_original_response()`/`edit_original_response()` target the picker message instead of the "thinking" placeholder).
-* [x] Changed that ephemeral placeholder from being deleted to being edited in place into a "✅ Audio obtained successfully. Playing: **[Title](link)**" confirmation, right before the public "Now playing" embed is sent.
-* [x] Confirmed (via live testing) that manually dismissing an ephemeral message client-side does not delete it server-side — `edit_original_response()` never raised `NotFound` in that scenario; the existing `try/except discord.HTTPException` guard was kept regardless, as a safeguard for interaction-token expiry.
+### In-Discord Error Messages
+* [x] Wrapped yt-dlp extraction (`ydl.extract_info`) and `_play_track` calls in both the direct-URL
+  and search-selection flows in `try/except`, catching `yt_dlp.utils.DownloadError` and
+  `discord.ClientException` with tailored user-facing messages, plus a generic `except Exception`
+  fallback, via a new `_build_error_message()` helper.
+* [x] Notified the channel directly (not via the interaction, which may be long expired by then)
+  when the 10-consecutive-failures cap is hit.
 
-### Loop Playback Feature (implemented, reverted, then re-implemented)
-* [x] Re-implemented infinite single-track looping in `_play_track` (per-guild `_playback_generation` counter to avoid a stale `after()` callback re-triggering playback of a superseded track), after having deliberately shipped the Components V2 redesign as its own commit first, without the loop, to keep commits scoped.
-* [x] Investigated FFmpeg `stderr` noise appearing on every loop iteration and occasionally on `/leave-voice-chat` (`IO error -10054`, `Will reconnect...`), cross-checked with an AI specialized in FFmpeg (reviewing `libavformat/http.c`'s `http_buf_read()` reconnect logic) and with `discord.py`'s own `FFmpegAudio._check_process_returncode()`/`cleanup()` logic. Confirmed these lines are benign (`AV_LOG_WARNING`, process still exits with code 0) and downgraded them from `ERROR` to `WARNING` in `_FFmpegStderrLogger.write()`, keeping only `"Failed to reconnect at"` as a genuine `ERROR`.
-* [x] Documented this benign-noise pattern in `context.md` (see Architecture Decision #7) so it isn't mistaken for a bug in future sessions.
-
-### Logging Configuration
-* [x] Reduced the rotating log file size cap from 2 MB to 1 MB per file (`logs/all.log`, `logs/errors.log`), keeping the same 3-files-per-category retention.
+### Discord Channel/Thread Log Mirroring
+* [x] Added `LOGS_CHANNEL_ID`/`ERRORS_THREAD_ID` env vars and a `_DiscordHandler` in
+  `utils/logger.py` that mirrors WARNING/ERROR logs to both a channel and a thread, plus
+  startup-ready and command-usage `INFO` lines to the channel only (via `extra={"channel_notify": True}`).
+* [x] Fixed a `NameError` caused by handler/filter classes being referenced before their
+  definition, by reordering the file.
+* [x] Fixed a missing `channel_notify` flag on the `/play` usage log line (present on
+  `/leave-voice-chat` but initially missed on `/play`), which caused that specific line to
+  never reach the channel.
+* [x] Confirmed mirrored messages are truncated (not split) at 1900 characters before being
+  wrapped in a code block, staying under Discord's 2000-character message limit by design.
 
 ---
 
@@ -248,7 +313,7 @@ manual-dismiss case.
   - Discord client-side feedback/echo suppression triggered by having both the bot and a human listener active from the same local network/device context.
   - Test with the mobile device on the *same* wifi as the bot (instead of mobile data) to try to reproduce the issue there too.
   - Test with a third device (a different laptop/PC) on the bot's network, distinct from the one running the bot.
-* [ ] **Show user-facing error messages in Discord itself** when something fails during playback/extraction — ffmpeg process failures, yt-dlp extraction failures, or any other failure in the audio pipeline — so failures are visible from the Discord client without needing to check the console/log files. Scope this for both the direct-URL flow and the search-selection flow (including a message like `"Could not fetch the video \`title\` (\`link\`)"` when a title is known, or without the parenthetical when it isn't — this was explicitly deferred from the previous session to its own separate commit).
+* [x] ~~Show user-facing error messages in Discord itself~~ — **done 21/08/2026** (see Architecture Decision #10). Still open: the message wording is currently generic (`Could not fetch that URL`, `Something unexpected went wrong`) rather than always including the resolved title/link — revisit wording once more real-world failure cases are observed.
 * [ ] Remove the temporary diagnostic instrumentation added in a previous session (DAVE session `repr()` check and audio packet counter wrapper) once the laptop-side playback issue is resolved.
 * [ ] Decide whether to keep `discord.player`/`discord.voice_state` DEBUG logs enabled/commented for ongoing development.
 
@@ -257,6 +322,7 @@ manual-dismiss case.
 * [ ] Confirm final `player_client` list (`tv_downgraded`, `web_embedded`, `tv`) remains stable across different videos (age-restricted, live streams, etc.) — currently only validated with a couple of test videos.
 * [ ] Decide whether to drop `tv` from `player_client` given its DRM-experiment warning (`tv_downgraded` did not show this warning in manual testing).
 * [ ] If richer per-result data (e.g. release year) is needed later, evaluate a non-flat extraction only for the user's final selection (costs one extra request, only once per search).
+* [ ] Confirm the exact discord.py-side mechanism behind `_on_playback_finished` receiving `error=None` on an instant FFmpeg failure (suspected race between our rapid `voice_client.play()` restarts and `FFmpegAudio._check_process_returncode()`'s `self._stopped` guard) — not blocking anymore thanks to the elapsed-time failsafe, but still an open unknown worth closing out.
 
 ### Low Priority (Packaging Phase)
 
@@ -290,5 +356,5 @@ manual-dismiss case.
 - **The full discord.py + davey (DAVE E2EE) + UDP transmission pipeline is confirmed healthy** via direct runtime instrumentation (DAVE session `ready=true`/`ACTIVE`, 1,300+ audio packets sent with zero drops) and via a successful cross-device listening test. Do not re-investigate discord.py, davey, or the packet transmission layer unless new evidence contradicts this.
 - The remaining playback problem is scoped to **why the laptop running the bot cannot hear the audio it is itself transmitting, while other devices on other networks can.** This is deferred, to be tested from a different laptop/network.
 - **New this session:** the project is now organized into `commands/` and `utils/` packages instead of a single `main.py`. Any AI continuing work should be aware that `utils/paths.py` resolves the project root relative to its *own* file location (one level up from `utils/`), not relative to `main.py` — this was the source of a real regression today and should be checked again whenever files are moved.
-- **New this session:** logging is now split across the console, `logs/all.log`, and `logs/errors.log` (rotating, 2 MB / 3 files each), all sharing the same emoji-based formatter. FFmpeg errors and yt-dlp warnings/errors both flow through this same system now — there is no longer a "silent" failure path in the parts of the pipeline exercised so far.
+- **New this session:** logging is now split across the console, `logs/all.log`, and `logs/errors.log` (rotating, 1 MB / 3 files each), all sharing the same emoji-based formatter. FFmpeg errors and yt-dlp warnings/errors both flow through this same system now — there is no longer a "silent" failure path in the parts of the pipeline exercised so far.
 - **New this session:** `/play` now supports plain search terms in addition to direct URLs, with a paginated, ephemeral, author-restricted button UI (`_SearchResultsView` in `commands/play.py`).

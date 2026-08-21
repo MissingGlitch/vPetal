@@ -5,13 +5,15 @@ from dotenv import load_dotenv
 
 # logger must be imported before any module that uses "logger",
 # since importing it is what configures all handlers/formatters.
-from utils.logger import logger
+from utils.logger import logger, set_discord_destinations
 from commands import play, leave
 
 # Load environment variables from .env file
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID"))
+LOGS_CHANNEL_ID = int(os.getenv("LOGS_CHANNEL_ID"))
+ERRORS_THREAD_ID = int(os.getenv("ERRORS_THREAD_ID"))
 
 #* Discord client setup
 intents = discord.Intents.default()
@@ -30,7 +32,15 @@ async def on_ready():
 	"""Fires when the bot successfully connects to Discord and is ready."""
 	tree.copy_global_to(guild=TEST_GUILD)
 	await tree.sync(guild=TEST_GUILD)
-	logger.info(f"🟢  I'm connected and ready to receive commands! 🟢")
+
+	# Wire up Discord-mirrored logging as early as possible, so the
+	# "connected and ready" line below (marked channel_notify=True)
+	# actually reaches the logs channel instead of being silently dropped.
+	logs_channel = client.get_channel(LOGS_CHANNEL_ID) or await client.fetch_channel(LOGS_CHANNEL_ID)
+	errors_thread = client.get_channel(ERRORS_THREAD_ID) or await client.fetch_channel(ERRORS_THREAD_ID)
+	set_discord_destinations(client, logs_channel, errors_thread)
+
+	logger.info(f"🟢  I'm connected and ready to receive commands! 🟢", extra={"channel_notify": True})
 
 # --- Entry point ---
 # log_handler=None disables discord.py's own default logging setup

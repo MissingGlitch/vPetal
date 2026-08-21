@@ -1,6 +1,15 @@
 import os
+import asyncio
 import logging
 import logging.handlers
+from dotenv import load_dotenv
+
+
+# Loaded here (not only in main.py) so LOGS_CHANNEL_ID/ERRORS_THREAD_ID are
+# available regardless of import order, since this module is imported
+# before main.py's own load_dotenv() call.
+load_dotenv()
+
 
 #* Logging configuration
 # Custom formatter: prepends an emoji based on the log level, and formats
@@ -49,6 +58,88 @@ _errors_file_handler = logging.handlers.RotatingFileHandler(
 _errors_file_handler.setLevel(logging.WARNING)
 _errors_file_handler.setFormatter(_formatter)
 
+
+#* Discord channel/thread log mirroring: selected records also get sent
+# live to a Discord channel (LOGS_CHANNEL_ID) and its errors thread
+# (ERRORS_THREAD_ID). Populated lazily via set_discord_destinations(),
+# called once from main.py's on_ready once the client/loop exist; until
+# then, records routed here are silently dropped instead of raising.
+_discord_client = None
+_logs_channel = None
+_errors_thread = None
+
+
+def set_discord_destinations(client, logs_channel, errors_thread):
+	"""Called once from on_ready to wire up where Discord-mirrored logs go."""
+	global _discord_client, _logs_channel, _errors_thread
+	_discord_client = client
+	_logs_channel = logs_channel
+	_errors_thread = errors_thread
+
+
+# Separate, undecorated logger used only to report a failure to mirror a
+# log record to Discord itself (e.g. missing permissions, deleted channel).
+# Deliberately has no Discord handler attached, so a mirroring failure
+# can never trigger another mirroring attempt (no feedback loop).
+_discord_mirror_diag_logger = logging.getLogger("vPetal.discord_mirror")
+_discord_mirror_diag_logger.setLevel(logging.ERROR)
+_discord_mirror_diag_logger.addHandler(_handler)
+_discord_mirror_diag_logger.addHandler(_errors_file_handler)
+_discord_mirror_diag_logger.propagate = False
+
+
+def _on_discord_send_done(future):
+	try:
+		future.result()
+	except Exception as exc:
+		_discord_mirror_diag_logger.error(f"Failed to mirror a log record to Discord: {exc}")
+
+
+class _DiscordHandler(logging.Handler):
+	"""Mirrors log records into a Discord channel or thread. emit() stays
+	non-blocking: the actual send() is scheduled onto the bot's asyncio
+	loop via run_coroutine_threadsafe() instead of awaited directly, since
+	log calls can happen from any thread (e.g. the AudioPlayer thread
+	calling logger.error() for FFmpeg failures)."""
+
+	def __init__(self, get_destination, level=logging.NOTSET):
+		super().__init__(level)
+		self._get_destination = get_destination
+
+	def emit(self, record: logging.LogRecord) -> None:
+		destination = self._get_destination()
+		if _discord_client is None or destination is None:
+			return
+		try:
+			text = self.format(record)
+		except Exception:
+			return
+		# Discord's 2000-character message limit; wrapped in a code block
+		# so multi-line tracebacks/log lines stay readable.
+		if len(text) > 1900:
+			text = text[:1900] + "… [truncated]"
+		future = asyncio.run_coroutine_threadsafe(destination.send(f"```{text}```"), _discord_client.loop)
+		future.add_done_callback(_on_discord_send_done)
+
+
+class _ChannelFilter(logging.Filter):
+	"""Lets WARNING/ERROR records through unconditionally (mirroring the
+	errors thread), plus any record explicitly marked with
+	extra={"channel_notify": True} (startup-ready and command-usage logs)."""
+
+	def filter(self, record: logging.LogRecord) -> bool:
+		return record.levelno >= logging.WARNING or getattr(record, "channel_notify", False)
+
+
+_channel_handler = _DiscordHandler(lambda: _logs_channel)
+_channel_handler.setFormatter(_formatter)
+_channel_handler.addFilter(_ChannelFilter())
+
+_thread_handler = _DiscordHandler(lambda: _errors_thread)
+_thread_handler.setLevel(logging.WARNING)
+_thread_handler.setFormatter(_formatter)
+
+
 #* Separate logger for our own bot events (command usage, playback flow),
 # kept independent from discord.py's internal "discord" logger.
 logger = logging.getLogger("vPetal")
@@ -56,6 +147,9 @@ logger.setLevel(logging.DEBUG)
 logger.addHandler(_handler)
 logger.addHandler(_all_file_handler)
 logger.addHandler(_errors_file_handler)
+logger.addHandler(_channel_handler)
+logger.addHandler(_thread_handler)
+
 
 #* Apply the same formatter to discord.py's own top-level logger, so every
 # log line (ours and the library's) follows the same readable format.
@@ -64,7 +158,10 @@ discord_logger.setLevel(logging.INFO)
 discord_logger.addHandler(_handler)
 discord_logger.addHandler(_all_file_handler)
 discord_logger.addHandler(_errors_file_handler)
+discord_logger.addHandler(_channel_handler)
+discord_logger.addHandler(_thread_handler)
 discord_logger.propagate = False
+
 
 # --- Deep debugging (commented out by default) ---
 # Low-level voice protocol: state machine transitions during the voice
