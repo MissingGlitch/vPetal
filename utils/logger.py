@@ -1,4 +1,5 @@
 import os
+import time
 import asyncio
 import logging
 import logging.handlers
@@ -17,8 +18,8 @@ load_dotenv()
 class _EmojiFormatter(logging.Formatter):
 	EMOJIS = {
 		logging.DEBUG: "📄",
-		logging.INFO: "ℹ️ ",
-		logging.WARNING: "⚠️ ",
+		logging.INFO: "ℹ️",
+		logging.WARNING: "⚠️",
 		logging.ERROR: "❌",
 	}
 
@@ -100,26 +101,61 @@ class _DiscordHandler(logging.Handler):
 	non-blocking: the actual send() is scheduled onto the bot's asyncio
 	loop via run_coroutine_threadsafe() instead of awaited directly, since
 	log calls can happen from any thread (e.g. the AudioPlayer thread
-	calling logger.error() for FFmpeg failures)."""
+	calling logger.error() for FFmpeg failures).
+
+	Also self-throttles: at most MAX_MESSAGES_PER_WINDOW sends within any
+	WINDOW_SECONDS rolling window (tracked independently per instance, so
+	the channel handler and the thread handler each have their own
+	budget). Anything beyond that is dropped, not queued for later, and
+	counted; the next allowed message reports how many were dropped since
+	the last one that actually went through."""
+
+	MAX_MESSAGES_PER_WINDOW = 5
+	WINDOW_SECONDS = 10
 
 	def __init__(self, get_destination, level=logging.NOTSET):
 		super().__init__(level)
 		self._get_destination = get_destination
+		self._sent_at = []
+		self._suppressed_count = 0
 
 	def emit(self, record: logging.LogRecord) -> None:
 		destination = self._get_destination()
 		if _discord_client is None or destination is None:
 			return
+
+		now = time.monotonic()
+		self._sent_at = [t for t in self._sent_at if now - t < self.WINDOW_SECONDS]
+		if len(self._sent_at) >= self.MAX_MESSAGES_PER_WINDOW:
+			self._suppressed_count += 1
+			return
+
 		try:
 			text = self.format(record)
 		except Exception:
 			return
+		if self._suppressed_count:
+			text = f"[+{self._suppressed_count} more message(s) suppressed to avoid flooding this channel]\n{text}"
+			self._suppressed_count = 0
 		# Discord's 2000-character message limit; wrapped in a code block
 		# so multi-line tracebacks/log lines stay readable.
 		if len(text) > 1900:
 			text = text[:1900] + "… [truncated]"
+		self._sent_at.append(now)
 		future = asyncio.run_coroutine_threadsafe(destination.send(f"```{text}```"), _discord_client.loop)
 		future.add_done_callback(_on_discord_send_done)
+
+
+class _NoiseFilter(logging.Filter):
+	"""Blocks specific loggers known to be noisy and not worth mirroring to
+	Discord, even at WARNING/ERROR level locally (e.g. discord.py's own
+	rate-limit retries, which can fire many times in a row and would
+	otherwise flood the channel/thread with duplicate, low-value lines)."""
+
+	NOISY_LOGGERS = {"discord.http"}
+
+	def filter(self, record: logging.LogRecord) -> bool:
+		return record.name not in self.NOISY_LOGGERS
 
 
 class _ChannelFilter(logging.Filter):
@@ -134,10 +170,12 @@ class _ChannelFilter(logging.Filter):
 _channel_handler = _DiscordHandler(lambda: _logs_channel)
 _channel_handler.setFormatter(_formatter)
 _channel_handler.addFilter(_ChannelFilter())
+_channel_handler.addFilter(_NoiseFilter())
 
 _thread_handler = _DiscordHandler(lambda: _errors_thread)
 _thread_handler.setLevel(logging.WARNING)
 _thread_handler.setFormatter(_formatter)
+_thread_handler.addFilter(_NoiseFilter())
 
 
 #* Separate logger for our own bot events (command usage, playback flow),

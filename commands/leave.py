@@ -8,7 +8,7 @@ def setup(tree: discord.app_commands.CommandTree):
 	@tree.command(name="leave-voice-chat", description="Stops playback and disconnects the bot from the voice channel.")
 	async def stop(interaction: discord.Interaction):
 		"""Stops audio playback and disconnects the bot from the voice channel."""
-		logger.info(f"🕹️   @{interaction.user} used /leave-voice-chat 🕹️", extra={"channel_notify": True})
+		logger.info(f"🕹️ @{interaction.user} used /leave-voice-chat 🕹️", extra={"channel_notify": True})
 		voice_client = interaction.guild.voice_client
 
 		# Verify the bot is actually connected before attempting to stop
@@ -21,5 +21,5 @@ def setup(tree: discord.app_commands.CommandTree):
 		logger.debug("Stopping playback and disconnecting from voice channel")
 		voice_client.stop()
 		await voice_client.disconnect()
-		logger.info(f"⏸️   Disconnected from voice channel (requested by @{interaction.user}) ⏸️")
+		logger.info(f"⏸️ Disconnected from voice channel (requested by @{interaction.user}) ⏸️")
 		await interaction.response.send_message("Stopped and disconnected.")

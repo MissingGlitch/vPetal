@@ -1,7 +1,10 @@
 # vPetal — Project Context
 
 - **Last Updated:** Friday, 21/08/2026
-- **Status:** In active development (Error Handling & Discord Log Mirroring Phase — playback failsafe, in-Discord error messages, and Discord-mirrored logging channel/thread all complete)
+- **Status:** Feature-complete and usable end-to-end (playback, retries/failsafe, in-Discord error
+  messages, Discord-mirrored logging, and a working standalone `.exe` with voice support are all
+  in place). Remaining Pending Tasks are polish/nice-to-haves, not blockers — the bot can be used
+  as-is.
 
 ---
 
@@ -172,8 +175,13 @@ in FFmpeg (reviewing `libavformat/http.c`'s `http_buf_read()` reconnect logic):*
   appeared in this project's logs so far.
 - `_FFmpegStderrLogger.write()` (in `commands/play.py`) already accounts for
   this: it downgrades lines containing `"Will reconnect"`, `"Error in the
-  pull function"`, or `"IO error"` to `WARNING`, while keeping `"Failed to
-  reconnect at"` (and anything else) as `ERROR`.
+  pull function"`, or `"IO error"` to `DEBUG` (previously `WARNING`), tagged
+  with a `[controlled-benign-warning]` marker so they remain identifiable in
+  `logs/all.log`/console without being treated as an actual warning anymore,
+  while keeping `"Failed to reconnect at"` (and anything else) as `ERROR`.
+  This downgrade also has the side effect of excluding these lines from the
+  Discord channel/thread mirror entirely, since that mirror only forwards
+  `WARNING`/`ERROR` (see Architecture Decision #11).
 
 **Takeaway for anyone reading the logs:** seeing these `WARNING`-level FFmpeg
 lines on every loop iteration and occasionally on `/leave-voice-chat` is
@@ -267,6 +275,18 @@ raw output) stays in the console and log files only, never in the Discord-facing
 * Ordering constraint: the `_DiscordHandler`/`_ChannelFilter`/`_channel_handler`/`_thread_handler`
   definitions must appear in the file **before** `logger.addHandler(_channel_handler)` — this
   caused a real `NameError` during implementation from defining them out of order.
+* **Rate-limit flood fix (this session):** two additional safeguards were added on top of the
+  existing WARNING/ERROR mirroring:
+  - **Layer 2 — stop `discord.http`'s own retry warnings from being mirrored:** the `discord.http`
+    child logger (which emits `"We are being rate limited... Retrying in X seconds"` on every
+    429) had its `propagate` explicitly set to `False` relative to the Discord-mirroring handlers,
+    since Python's logging propagation runs per-logger and is unaffected by the parent `discord`
+    logger's own `propagate = False` setting.
+  - **Layer 3 — a general throttle inside `_DiscordHandler.emit()`:** a per-destination
+    (channel/thread) sliding window caps mirrored messages at 5 per 10 seconds; any message beyond
+    that budget within the window is suppressed and replaced by a single
+    `[+N more message(s) suppressed...]` notice on the next message that does get through — a
+    safeguard against any future source of log bursts, not just the two cases fixed directly above.
 
 ### 12. Command Sync Decoupled From Startup
 
@@ -374,6 +394,11 @@ from `main.py` once confirmed fixed; only the three `pyinstaller` flags (`--coll
   rate-limit retry warnings get mirrored to the logs channel in quick succession, partly
   self-feeding since the rate-limit warning itself is also mirrored. Fix deferred to next session
   (see Pending Tasks).
+* [x] Fixed the rate-limit flood: downgraded benign FFmpeg reconnect lines from `WARNING` to
+  `DEBUG` (tagged `[controlled-benign-warning]`) in `_FFmpegStderrLogger`, stopped `discord.http`'s
+  own retry-warning logger from propagating into the Discord-mirroring handlers, and added a
+  5-messages/10-seconds throttle inside `_DiscordHandler.emit()` as a general safeguard. Confirmed
+  working end-to-end by reproducing the original flood scenario again with no further `429`s mirrored.
 
 ---
 
@@ -381,13 +406,15 @@ from `main.py` once confirmed fixed; only the three `pyinstaller` flags (`--coll
 
 ### High Priority — Active Bug Investigation (deferred, scope narrowed)
 
-* [ ] **Discord API rate-limit (`429`) flood from mirrored FFmpeg `WARNING` lines** — decided
-  approach: keep all warnings (no blanket level-based suppression), instead (a) stop
-  `discord.http`'s own logger from propagating into the `vPetal`-attached handlers, and
-  (b) extend `_ChannelFilter` to exclude the specific known-benign FFmpeg reconnect strings
-  already downgraded to `WARNING` by `_FFmpegStderrLogger` (see Architecture Decision #7:
-  `"Will reconnect"`, `"Error in the pull function"`, `"IO error"`). Not yet implemented —
-  needs the current `_ChannelFilter`/`_DiscordHandler` code pasted in to produce the exact patch.
+* [x] ~~Discord API rate-limit (`429`) flood from mirrored FFmpeg `WARNING` lines~~ — **done
+  21/08/2026**. Final approach ended up simpler than originally planned: instead of adding a
+  `_ChannelFilter` exclusion for specific FFmpeg strings, those lines were downgraded from
+  `WARNING` to `DEBUG` at the source (`_FFmpegStderrLogger`, see Architecture Decision #7),
+  which automatically excludes them from the mirror. Combined with stopping `discord.http`'s
+  retry warnings from propagating into the mirror handlers, and a general 5-messages/10-seconds
+  throttle in `_DiscordHandler.emit()` as a catch-all safeguard (see Architecture Decision #11).
+  Confirmed working: no more `429` floods reproduced under the same test scenario that originally
+  triggered this.
 * [ ] **[BLOCKING, scope narrowed] No audio heard specifically when listening from the same laptop that runs the bot process** — confirmed working from a separate mobile device on a different network. To test next session, from a different laptop/network at home:
   - NAT hairpinning / double NAT on the home router (same public IP for bot sender and laptop listener).
   - Wrong audio output device selected in that specific Discord client/browser session on the laptop.

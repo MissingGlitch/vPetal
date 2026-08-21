@@ -54,7 +54,12 @@ class _FFmpegStderrLogger:
 			if "Failed to reconnect at" in line:
 				logger.error(f"[FFMPEG] {line}")
 			elif "Will reconnect" in line or "Error in the pull function" in line or "IO error" in line:
-				logger.warning(f"[FFMPEG] {line}")
+				# Downgraded to DEBUG: confirmed benign (Architecture Decision #7).
+				# Tagged so it's still identifiable as a controlled/expected
+				# warning rather than a genuine debug-level implementation detail.
+				# As a side effect, this level also keeps it out of the Discord
+				# channel/thread mirror (_ChannelFilter only lets WARNING+ through).
+				logger.debug(f"[FFMPEG] [controlled-benign-warning] {line}")
 			else:
 				logger.error(f"[FFMPEG] {line}")
 
@@ -235,7 +240,7 @@ async def _play_track(interaction: discord.Interaction, voice_channel: discord.V
 
 	logger.debug("Starting playback with FFmpeg")
 	_play_source()
-	logger.info(f"🎵  Now playing \"{title}\" on loop (requested by @{interaction.user}) 🎵", extra={"channel_notify": True})
+	logger.info(f"🎵 Now playing \"{title}\" on loop (requested by @{interaction.user}) 🎵", extra={"channel_notify": True})
 
 	await interaction.followup.send(embed=_build_now_playing_embed(info, interaction))
 
@@ -446,7 +451,7 @@ def setup(tree: discord.app_commands.CommandTree):
 		"""Joins the caller's voice channel and streams audio from the given
 		URL, or shows paginated search results to pick from."""
 		# Log command usage: who invoked it, and with which query
-		logger.info(f"🕹️   @{interaction.user} used /play with query=\"{query}\" in guild=\"{interaction.guild}\" 🕹️", extra={"channel_notify": True})
+		logger.info(f"🕹️ @{interaction.user} used /play with query=\"{query}\" in guild=\"{interaction.guild}\" 🕹️", extra={"channel_notify": True})
 
 		# Verify the user is currently in a voice channel
 		if interaction.user.voice is None:
