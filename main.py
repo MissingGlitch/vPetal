@@ -11,7 +11,6 @@ from commands import play, leave
 # Load environment variables from .env file
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
-DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID"))
 LOGS_CHANNEL_ID = int(os.getenv("LOGS_CHANNEL_ID"))
 ERRORS_THREAD_ID = int(os.getenv("ERRORS_THREAD_ID"))
 
@@ -23,9 +22,6 @@ tree = app_commands.CommandTree(client)
 #* Register commands from their own files onto the shared tree
 play.setup(tree)
 leave.setup(tree)
-
-# Guild used for development
-TEST_GUILD = discord.Object(id=DEV_GUILD_ID)
 
 @client.event
 async def on_ready():

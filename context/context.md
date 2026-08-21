@@ -43,6 +43,7 @@ discord.py[voice]
 yt-dlp
 yt-dlp-ejs
 python-dotenv
+pyinstaller
 ```
 
 ### System Dependencies (Portable Binaries)
@@ -69,31 +70,36 @@ The `.env` file is excluded from Git tracking via `.gitignore`.
 ## Directory Structure
 ```plaintext
 vPetal/
-├── .venv/					← Python virtual environment			(Git-ignored)
+├── .venv/					              ← Python virtual environment			(Git-ignored)
 ├── dependencies/
-│   ├── ffmpeg.exe			← Portable FFmpeg binary for Windows	(Git-ignored)
-│   └── deno.exe			← Portable Deno binary for Windows		(Git-ignored)
+│   ├── ffmpeg.exe			          ← Portable FFmpeg binary for Windows	(Git-ignored)
+│   └── deno.exe			            ← Portable Deno binary for Windows		(Git-ignored)
 ├── commands/
-│   ├── __init__.py			← Empty; marks the folder as an importable package
-│   ├── play.py				← /play command
-│   └── leave.py			← /leave-voice-chat command
+│   ├── __init__.py			          ← Empty; marks the folder as an importable package
+│   ├── play.py				            ← /play command
+│   └── leave.py			            ← /leave-voice-chat command
 ├── utils/
-│   ├── __init__.py			← Empty; marks the folder as an importable package
-│   ├── paths.py			← FFMPEG_PATH / DENO_PATH resolution
-│   ├── logger.py			← "vPetal" custom logger
-│   └── youtube.py			← YDL_OPTIONS / SEARCH_YDL_OPTIONS
+│   ├── __init__.py			          ← Empty; marks the folder as an importable package
+│   ├── paths.py			            ← FFMPEG_PATH / DENO_PATH resolution
+│   ├── logger.py			            ← "vPetal" custom logger
+│   └── youtube.py			          ← YDL_OPTIONS / SEARCH_YDL_OPTIONS
 ├── logs/
-│   ├── all.log(.1)(.2)		← All log levels, rotated 		(max 3 files, 1 MB each)	(Git-ignored)
-│   └── errors.log(.1)(.2)	← WARNING/ERROR only, rotated 	(max 3 files, 1 MB each)	(Git-ignored)
-├── main.py					← Bot entry point
-├── ffmpeg_debug.log		← Temporary debug file				(Git-ignored, diagnostic only)
-├── .env					← Secret environment variables		(Git-ignored)
+│   ├── all.log(.1)(.2)		        ← All log levels, rotated 		(max 3 files, 1 MB each)	(Git-ignored)
+│   └── errors.log(.1)(.2)	      ← WARNING/ERROR only, rotated (max 3 files, 1 MB each)	(Git-ignored)
+├── scripts/
+│   ├── __init__.py               ← Empty; marks the folder as an importable package
+│   ├── sync_commands_global.py   ← Pushes the command tree as GLOBAL commands
+│   ├── sync_commands_locally.py	← Pushes the command tree as GUILD commands to DEV_GUILD_ID
+│   ├── build_exe.py              ← Bakes secrets into main.py, runs PyInstaller, restores main.py
+│   └── clean_build.py            ← Removes build/, dist/, and vPetal.spec
+├── main.py                       ← Bot entry point
+├── .env                          ← Secret environment variables (Git-ignored)
 ├── .gitignore
 ├── context/
-│   ├── context.md						← This context documentation file
+│   ├── context.md						        ← This context documentation file
 │   └── youtube-problem-explained.md	← A detailed explanation of the problem with YouTube
-├── README.md							← Repository README
-└── requirements.txt					← Core dependencies file
+├── README.md							            ← Repository README
+└── requirements.txt					        ← Core dependencies file
 ```
 ---
 
@@ -262,6 +268,53 @@ raw output) stays in the console and log files only, never in the Discord-facing
   definitions must appear in the file **before** `logger.addHandler(_channel_handler)` — this
   caused a real `NameError` during implementation from defining them out of order.
 
+### 12. Command Sync Decoupled From Startup
+
+`main.py` no longer calls `tree.copy_global_to()`/`tree.sync()` inside `on_ready` — with
+development effectively wrapping up, re-syncing commands on every startup was no longer
+necessary and only added an extra HTTP round-trip to every boot. Syncing is now a deliberate,
+manual action via two standalone scripts under `scripts/`:
+* `sync_commands_global.py` — calls `tree.sync()` with no guild, pushing GLOBAL commands
+  (subject to Discord's propagation delay).
+* `sync_commands_locally.py` — calls `tree.copy_global_to(guild=TEST_GUILD)` +
+  `tree.sync(guild=TEST_GUILD)`, exactly like `main.py` used to do, scoped to `DEV_GUILD_ID`.
+
+Both scripts require running as a module (`python -m scripts.sync_commands_locally`, not
+`python scripts/sync_commands_locally.py`) since they import from the `commands` package —
+running the file directly puts only `scripts/` on `sys.path`, not the project root, causing a
+`ModuleNotFoundError`. This same constraint applies to `build_exe.py` and `clean_build.py`.
+
+### 13. Standalone `.exe` Build Pipeline (PyInstaller)
+
+`scripts/build_exe.py` automates the full build: it first removes any stale `build/`, `dist/`,
+and `vPetal.spec` (via `scripts/clean_build.py`'s `clean_build_artifacts()`, imported and reused
+rather than duplicated), then temporarily rewrites `main.py`'s three `os.getenv(...)` lines
+(`BOT_TOKEN`, `LOGS_CHANNEL_ID`, `ERRORS_THREAD_ID`) into literal values read from `.env`, runs
+`pyinstaller`, and restores the original `main.py` from a backup in a `finally` block regardless
+of build success/failure. This bakes the secrets into the `.exe` itself so the final distributed
+`.zip` never needs to include a `.env` file — an accepted tradeoff given this is a personal bot
+shared only with a closed group of friends, run manually per voice call, never hosted 24/7.
+
+**Two PyInstaller-specific runtime failures were diagnosed and fixed this session, both only
+reproducible in the frozen `.exe`, never in `python main.py`:**
+* `RuntimeError: PyNaCl library needed in order to use voice` — root-caused (via a diagnostic
+  `import nacl.secret, nacl.utils` block added temporarily at the very top of `main.py`, printing
+  the full traceback with `flush=True`) to `ModuleNotFoundError: No module named '_cffi_backend'`,
+  a native extension `nacl.bindings` depends on via `cffi` that PyInstaller's static analysis
+  didn't pull in automatically. Fixed by adding `--collect-all cffi` to the `pyinstaller` command
+  in `build_exe.py` (the actual root cause fix); `--collect-all nacl` was kept alongside it as a
+  safety redundancy from an earlier diagnostic step, though not strictly required on its own.
+* `discord.opus.OpusNotLoaded` (raised on `voice_client.play(...)`) — root-caused to
+  `discord/opus.py`'s `_load_default()` resolving `libopus-0.x64.dll` via a path relative to
+  discord.py's own installed location, which PyInstaller's module analysis doesn't capture since
+  it's a bundled data file, not an import. Fixed by adding `--collect-data discord` to the same
+  `pyinstaller` command, which bundles discord.py's `bin/` folder (including the `.dll`) into the
+  frozen app.
+
+Both diagnostic blocks (the `nacl` import traceback and the `has_nacl`/opus checks) were removed
+from `main.py` once confirmed fixed; only the three `pyinstaller` flags (`--collect-all cffi`,
+`--collect-all nacl`, `--collect-data discord`) remain as the permanent fix.
+
 ---
 
 ## What Was Done Today (21/08/2026)
@@ -301,12 +354,40 @@ raw output) stays in the console and log files only, never in the Discord-facing
 * [x] Confirmed mirrored messages are truncated (not split) at 1900 characters before being
   wrapped in a code block, staying under Discord's 2000-character message limit by design.
 
+### Command Sync Decoupled + Standalone `.exe` Build
+* [x] Removed `tree.copy_global_to()`/`tree.sync()` from `main.py`'s `on_ready`; created
+  `scripts/sync_commands_global.py` and `scripts/sync_commands_locally.py` as standalone,
+  manually-run alternatives.
+* [x] Added `scripts/__init__.py` after hitting a `ModuleNotFoundError` running a script
+  directly instead of via `python -m scripts.<name>`.
+* [x] Created `scripts/build_exe.py`: bakes `BOT_TOKEN`/`LOGS_CHANNEL_ID`/`ERRORS_THREAD_ID`
+  into `main.py` from `.env`, runs PyInstaller, restores `main.py` in a `finally` block.
+* [x] Diagnosed and fixed `RuntimeError: PyNaCl library needed` in the frozen `.exe`
+  (missing `_cffi_backend` native extension) via `--collect-all nacl`.
+* [x] Diagnosed and fixed `discord.opus.OpusNotLoaded` in the frozen `.exe` (missing bundled
+  `libopus-0.x64.dll` data file) via `--collect-data discord`.
+* [x] Confirmed end-to-end: built `.exe` successfully plays audio in a real voice channel.
+* [x] Created `scripts/clean_build.py` to remove `build/`, `dist/`, and `vPetal.spec`; refactored
+  `build_exe.py` to import and reuse its `clean_build_artifacts()` instead of duplicating the logic.
+* [x] Discovered (not yet fixed) a Discord API rate-limit (`429`) flood when many `WARNING`-level
+  FFmpeg reconnect lines (see Architecture Decision #7, expected/benign) and `discord.http`'s own
+  rate-limit retry warnings get mirrored to the logs channel in quick succession, partly
+  self-feeding since the rate-limit warning itself is also mirrored. Fix deferred to next session
+  (see Pending Tasks).
+
 ---
 
 ## Pending Tasks
 
 ### High Priority — Active Bug Investigation (deferred, scope narrowed)
 
+* [ ] **Discord API rate-limit (`429`) flood from mirrored FFmpeg `WARNING` lines** — decided
+  approach: keep all warnings (no blanket level-based suppression), instead (a) stop
+  `discord.http`'s own logger from propagating into the `vPetal`-attached handlers, and
+  (b) extend `_ChannelFilter` to exclude the specific known-benign FFmpeg reconnect strings
+  already downgraded to `WARNING` by `_FFmpegStderrLogger` (see Architecture Decision #7:
+  `"Will reconnect"`, `"Error in the pull function"`, `"IO error"`). Not yet implemented —
+  needs the current `_ChannelFilter`/`_DiscordHandler` code pasted in to produce the exact patch.
 * [ ] **[BLOCKING, scope narrowed] No audio heard specifically when listening from the same laptop that runs the bot process** — confirmed working from a separate mobile device on a different network. To test next session, from a different laptop/network at home:
   - NAT hairpinning / double NAT on the home router (same public IP for bot sender and laptop listener).
   - Wrong audio output device selected in that specific Discord client/browser session on the laptop.
@@ -326,8 +407,14 @@ raw output) stays in the console and log files only, never in the Discord-facing
 
 ### Low Priority (Packaging Phase)
 
-* [ ] Package as `.exe` using PyInstaller.
-* [ ] Configure PyInstaller `.spec` file to retain project assets (`dependencies/` folder), and re-verify `utils/paths.py`'s `sys.frozen` branch still resolves correctly given the new `utils/` folder depth.
+* [x] ~~Package as `.exe` using PyInstaller~~ — **done 21/08/2026**, confirmed working end-to-end
+  (voice playback included) via `scripts/build_exe.py` with `--collect-all cffi`,
+  `--collect-all nacl`, and `--collect-data discord` (see Architecture Decision #13).
+* [ ] Still not addressed: retaining `dependencies/` (`ffmpeg.exe`/`deno.exe`) alongside the
+  distributed `.exe`, and re-verifying `utils/paths.py`'s `sys.frozen` branch resolves correctly
+  now that the file lives in `utils/` — this was validated for FFmpeg/Deno path resolution logic
+  itself, but not yet re-confirmed against an actual `dependencies/` folder shipped next to the
+  built `.exe` in a real `.zip`.
 
 ### Additional Pending Tasks
 * [ ] Verify Deno and `yt-dlp-ejs` licenses allow redistribution inside the packaged `.exe`.
