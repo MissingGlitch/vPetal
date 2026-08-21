@@ -30,8 +30,9 @@ TEST_GUILD = discord.Object(id=DEV_GUILD_ID)
 @client.event
 async def on_ready():
 	"""Fires when the bot successfully connects to Discord and is ready."""
-	tree.copy_global_to(guild=TEST_GUILD)
-	await tree.sync(guild=TEST_GUILD)
+	# Command syncing is no longer done automatically on every startup —
+	# see scripts/sync_commands_global.py and scripts/sync_commands_local.py
+	# to push command changes to Discord when actually needed.
 
 	# Wire up Discord-mirrored logging as early as possible, so the
 	# "connected and ready" line below (marked channel_notify=True)
